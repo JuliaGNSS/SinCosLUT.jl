@@ -12,6 +12,16 @@ function ref_carrier(::Type{T}, N, P, Q, L) where T
     s, c
 end
 
+# Fused reduction over the iterator (width/type-agnostic via sum(s)).
+reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, 16, 125, n; backend = b); a += sum(s); end; a)
+# Measure allocations INSIDE a barrier so `b` is concrete at the @allocated site.
+# (A default-backend value is abstractly typed; on some Julia versions that boxes per
+# element when measured directly. Specialising here gives a true 0.)
+function alloc_of(t, b)
+    reduce_carrier(t, b, 4096)            # compile
+    @allocated reduce_carrier(t, b, 4096)
+end
+
 @testset "SinCosLUT" begin
     @testset "table construction" begin
         t = SinCosTable(Int8; steps = 64)
@@ -147,14 +157,8 @@ end
 
     @testset "iterator is allocation-free & prepare callable" begin
         tbl = SinCosTable(Int8; steps = 64)
-        # width-agnostic reduction (W differs per backend: 64/32/16/1). Pass an explicit,
-        # concrete backend so the iterator type is concrete and iteration allocates nothing
-        # on every Julia version. (With the *default* backend, `default_backend` returns an
-        # abstract Union that doesn't always const-fold, so iteration would box per element.)
-        reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, 16, 125, n; backend = b); a += sum(s); end; a)
-        @testset "alloc-free with $(backend_name(b))" for b in (default_backend(Int8, 64), Portable())
-            reduce_carrier(tbl, b, 4096)                       # warm (compile)
-            @test (@allocated reduce_carrier(tbl, b, 4096)) == 0
+        @testset "$(backend_name(b))" for b in (default_backend(Int8, 64), Portable())
+            @test alloc_of(tbl, b) == 0                       # 0 allocations (measured in a barrier)
             # prepare callable: every lane at index 2 -> table[3], for the backend's width
             p = prepare(tbl; backend = b)
             s, c = p(SIMD.Vec(ntuple(_ -> Int8(2), SinCosLUT._vwidth(b, Int8))))
