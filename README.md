@@ -199,6 +199,7 @@ AVX-512:
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
 | **SinCosLUT** Int8, steps=64       | **45**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=128      | **44**  | 4.3e-2 | ~5  |
 | FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 235     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
@@ -217,7 +218,9 @@ FixedPoint's drift-free DDA carrier is only marginally slower than its bare kern
 FixedPoint Int16 is the fastest *polynomial* carrier on both AVX-512 and AVX2; at
 float-grade accuracy FastSinCos edges FixedPoint Int32. SinCosLUT is the fastest of all on
 both AVX-512 and AVX2 — coarsest in accuracy, but the register-resident lookup beats every
-polynomial on raw throughput.
+polynomial on raw throughput. On AVX-512 the 128-entry table (two-register `vpermi2b`)
+doubles phase resolution to ~5 bits at the same throughput as the 64-entry table, so it is
+the better default there; AVX2's four-way `vpshufb` split supports only the 64-entry table.
 
 Takeaways:
 
