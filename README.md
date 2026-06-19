@@ -29,7 +29,7 @@ The lookup primitive is chosen automatically from the CPU:
 | backend  | instruction        | types        | notes |
 | -------- | ------------------ | ------------ | ----- |
 | AVX-512  | `vpermb`/`vpermw`/`vpermd` (+`vpermi2*`) | Int8/16/32 | fastest |
-| AVX2     | `vpshufb` + blends | Int8 only    | 64-entry via 4-way split; slower |
+| AVX2     | `vpshufb` + blends | Int8 only    | 64-entry via 4-way split; ~3× slower than AVX-512 |
 | NEON     | `tbl` (`tbl4`)     | Int8 only    | AArch64; 16 lanes |
 | portable | scalar             | Int8/16/32   | always available |
 
@@ -168,23 +168,24 @@ worst-case absolute error vs the true values, measured on a Zen 5 core. `~bits` 
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64  | **28**  | 5.2e-2 | ~4  |
-| **SinCosLUT** Int8, steps=128 | **34**  | 2.8e-2 | ~5  |
+| **SinCosLUT** Int8, steps=64  | **13**  | 5.2e-2 | ~4  |
+| **SinCosLUT** Int8, steps=128 | **13**  | 2.8e-2 | ~5  |
 | FixedPoint Int16 (Val 7)      | 103     | 1.3e-2 | ~6  |
 | FastSinCos `u100k`            | 187     | 3.2e-4 | ~12 |
 | FixedPoint Int32 (Val 8)      | 206     | 8.1e-3 | ~7  |
 | FastSinCos `u35`              | 226     | 6.0e-8 | ~24 |
 | FixedPoint Int32 (Val 14)     | 293     | 1.1e-4 | ~13 |
 
-**AVX2** (no native cross-lane byte permute — `vpermb` is unavailable)
+**AVX2** (no native cross-lane byte permute — `vpermb` is unavailable; the lookup is
+emulated with a four-way `vpshufb`+blend split)
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| FixedPoint Int16 (Val 7) | 123 | 1.3e-2 | ~6  |
-| FixedPoint Int32 (Val 8) | 246 | 8.1e-3 | ~7  |
-| FastSinCos `u100k`       | 250 | 3.2e-4 | ~12 |
-| FastSinCos `u35`         | 320 | 6.0e-8 | ~24 |
-| **SinCosLUT** Int8, steps=64 | 346 | 5.2e-2 | ~4 |
+| **SinCosLUT** Int8, steps=64 | **43** | 5.2e-2 | ~4 |
+| FixedPoint Int16 (Val 7) | 124 | 1.3e-2 | ~6  |
+| FastSinCos `u100k`       | 251 | 3.2e-4 | ~12 |
+| FixedPoint Int32 (Val 8) | 247 | 8.1e-3 | ~7  |
+| FastSinCos `u35`         | 322 | 6.0e-8 | ~24 |
 
 **End-to-end carrier** (phase generation + sincos, 0.01 cycles/sample). The kernel rows
 above feed *pre-computed* phases; here each package generates the carrier itself. This is
@@ -197,35 +198,37 @@ AVX-512:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **70**  | 9.3e-2 | ~3  |
-| FixedPoint Int16 (Val 7)           | **129** | 1.5e-2 | ~6  |
+| **SinCosLUT** Int8, steps=64       | **45**  | 9.3e-2 | ~3  |
+| FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 235     | 3.1e-4 | ~12 |
-| FixedPoint Int32 (Val 13)          | 318     | 2.4e-4 | ~12 |
+| FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
 
 AVX2:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| FixedPoint Int16 (Val 7)           | **143** | 1.5e-2 | ~6  |
-| FastSinCos `u100k` (Float32 phase) | 325     | 3.1e-4 | ~12 |
-| **SinCosLUT** Int8, steps=64       | 368     | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=64       | **62**  | 9.3e-2 | ~3  |
+| FixedPoint Int16 (Val 7)           | 142     | 1.5e-2 | ~6  |
+| FastSinCos `u100k` (Float32 phase) | 326     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 383     | 2.4e-4 | ~12 |
 
-FixedPoint's drift-free DDA carrier is only marginally slower than its bare kernel (129 vs
+FixedPoint's drift-free DDA carrier is only marginally slower than its bare kernel (131 vs
 103 ps on AVX-512) — integer phase generation is nearly free. At ~6-bit accuracy
-FixedPoint Int16 is the fastest *polynomial* carrier on both AVX-512 (~1.8×) and AVX2
-(~2.3×); at float-grade accuracy FastSinCos edges FixedPoint Int32. SinCosLUT is fastest
-of all on AVX-512 but coarsest, and (as in the kernel rows) loses its edge on AVX2.
+FixedPoint Int16 is the fastest *polynomial* carrier on both AVX-512 and AVX2; at
+float-grade accuracy FastSinCos edges FixedPoint Int32. SinCosLUT is the fastest of all on
+both AVX-512 and AVX2 — coarsest in accuracy, but the register-resident lookup beats every
+polynomial on raw throughput.
 
 Takeaways:
 
-- **On AVX-512, SinCosLUT is fastest by 3–7×** (one `vpermb` per result) — but only
-  ~4–5 bits accurate, set by the table's phase resolution.
-- **On AVX2, SinCosLUT loses its edge**: with no native byte permute the lookup is
-  emulated with a four-way `vpshufb`+blend split and is *slower* than either
-  polynomial package. On AVX2 (and Haswell), prefer FixedPoint or FastSinCos.
-- Pick by accuracy: **≤5-bit on AVX-512/NEON → SinCosLUT**; **~6–13-bit integer →
-  FixedPointSinCosApproximations**; **float-grade (12–24 bit) → FastSinCos**.
+- **SinCosLUT is fastest on both AVX-512 and AVX2** (one `vpermb` per result on AVX-512;
+  a four-way `vpshufb`+blend split on AVX2) — but only ~4–5 bits accurate, set by the
+  table's phase resolution.
+- **AVX2 is ~3× slower than AVX-512** here (half the lanes, plus the four-way emulation of
+  the missing byte permute), but still the fastest option at its accuracy — it is no
+  longer beaten by the polynomial packages.
+- Pick by accuracy: **≤5-bit → SinCosLUT** (any of AVX-512/AVX2/NEON); **~6–13-bit integer
+  → FixedPointSinCosApproximations**; **float-grade (12–24 bit) → FastSinCos**.
 
 (Reproduce both tables with `julia benchmark/comparison.jl`.)
 

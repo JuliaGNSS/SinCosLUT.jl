@@ -55,6 +55,9 @@ const HOST_FEATURES = _x86_features()
 _llvmtype(::Type{Int8}) = "i8"; _llvmtype(::Type{Int16}) = "i16"; _llvmtype(::Type{Int32}) = "i32"
 # Generate explicit @inline permute methods per element type. (A @generated
 # function here does not inline and adds ~1 call per permute → ~7× slower.)
+# The IR entry functions also carry `alwaysinline`: without it the (module,"entry")
+# llvmcall form emits a real `call` + register spill instead of the bare permute
+# (~2.5× slower here, far worse on the multi-op AVX2 path).
 # LLVM 32-bit suffix: permvar→"si", vpermi2var→"d"; 8/16-bit share qi/hi.
 for (Tt, L, et, pv, p2, feat) in (
         (Int8,  64, "i8",  "qi", "qi", "+avx512vbmi,+avx512bw,+avx512f"),
@@ -66,14 +69,14 @@ for (Tt, L, et, pv, p2, feat) in (
     define <$L x $et> @entry(<$L x $et> %0, <$L x $et> %1) #0 {
       %r = call <$L x $et> @llvm.x86.avx512.permvar.$pv.512(<$L x $et> %0, <$L x $et> %1)
       ret <$L x $et> %r }
-    attributes #0 = { "target-features"="$feat" }
+    attributes #0 = { alwaysinline "target-features"="$feat" }
     """
     p2_ir = """
     declare <$L x $et> @llvm.x86.avx512.vpermi2var.$p2.512(<$L x $et>, <$L x $et>, <$L x $et>)
     define <$L x $et> @entry(<$L x $et> %0, <$L x $et> %1, <$L x $et> %2) #0 {
       %r = call <$L x $et> @llvm.x86.avx512.vpermi2var.$p2.512(<$L x $et> %0, <$L x $et> %1, <$L x $et> %2)
       ret <$L x $et> %r }
-    attributes #0 = { "target-features"="$feat" }
+    attributes #0 = { alwaysinline "target-features"="$feat" }
     """
     @eval @inline _permvar(table::Vec{$L,$Tt}, index::Vec{$L,$Tt}) =
         Vec{$L,$Tt}(Base.llvmcall(($pv_ir, "entry"), $VE, Tuple{$VE,$VE}, table.data, index.data))
