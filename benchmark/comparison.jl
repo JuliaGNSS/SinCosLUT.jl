@@ -1,0 +1,87 @@
+# Reproduces the speed/accuracy comparison table in the README:
+# SinCosLUT.jl vs FastSinCos.jl (float polynomial) vs
+# FixedPointSinCosApproximations.jl (integer polynomial).
+#
+# Standalone script (NOT the AirspeedVelocity suite in benchmarks.jl). Run with:
+#     julia benchmark/comparison.jl
+#
+# Measures kernel throughput (computing BOTH sin and cos for an array of inputs) and
+# worst-case absolute error vs the true values, at AVX-512 and AVX2 widths. AVX2 rows
+# force the AVX2-width path on the same hardware (Float32×8 / Int8×32). Numbers depend
+# on the host CPU.
+
+using Pkg
+Pkg.activate(@__DIR__)
+# First run: set up deps (FastSinCos is unregistered -> add from GitHub; SinCosLUT is
+# this repo).
+try
+    @eval using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, BenchmarkTools, SIMD
+catch
+    Pkg.develop(path = dirname(@__DIR__))               # SinCosLUT (this repo)
+    Pkg.add(["BenchmarkTools", "SIMD"])
+    # FastSinCos is unregistered; FixedPoint's SIMD.Vec support is on master (newer
+    # than the registered release) — pull both from GitHub.
+    Pkg.add(url = "https://github.com/JuliaGNSS/FastSinCos.jl")
+    Pkg.add(url = "https://github.com/JuliaGNSS/FixedPointSinCosApproximations.jl")
+end
+using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, SIMD, BenchmarkTools, Printf
+using SinCosLUT: AVX512, AVX2
+
+const L = 16384
+const angles = Float32.((0:L-1) .* (2π * 7 / L))   # several cycles of continuous radians
+mn(b) = minimum(b).time
+ps(t) = round(t / L * 1000, digits = 1)
+
+# ---- FastSinCos: loop fast_sincos over Vec{W,Float32} ----
+fs_fill!(f, so, co, a, ::Val{W}) where {W} =
+    (@inbounds for i in 1:W:length(a); l = VecRange{W}(i); s, c = f(a[l]); so[l] = s; co[l] = c; end)
+fs_err(so, co, a) = maximum(max(abs(so[i] - sin(a[i])), abs(co[i] - cos(a[i]))) for i in eachindex(a))
+function run_fs(f, W)
+    s = zeros(Float32, L); c = zeros(Float32, L); fs_fill!(f, s, c, angles, Val(W))
+    (ps(mn(@benchmark fs_fill!($f, $s, $c, $angles, $(Val(W))))), fs_err(s, c, angles))
+end
+
+# ---- SinCosLUT: round angle -> phase index, lookup_sincos! ----
+function run_scl(T, steps, backend)
+    tbl = SinCosTable(T; steps = steps); amp = Float64(typemax(T))
+    idx = T.(mod.(round.(Int, angles ./ (2π) .* steps), steps))
+    s = zeros(T, L); c = zeros(T, L)
+    lookup_sincos!(s, c, idx, tbl; backend = backend)
+    err = maximum(max(abs(s[i] / amp - sin(angles[i])), abs(c[i] / amp - cos(angles[i]))) for i in eachindex(angles))
+    (ps(mn(@benchmark lookup_sincos!($s, $c, $idx, $tbl; backend = $backend))), err)
+end
+
+# ---- FixedPointSinCosApproximations: integer polynomial, N quarter-bits ----
+fp_fill!(so, co, ph, ::Val{N}, ::Val{W}) where {N,W} =
+    (@inbounds for i in 1:W:length(ph); l = VecRange{W}(i); s, c = fpsincos(ph[l], Val(N)); so[l] = s; co[l] = c; end)
+function run_fp(T, N, W)
+    amp = 2.0^N; ph = T.(round.(Int, angles .* (amp / (π / 2))))
+    s = zeros(T, L); c = zeros(T, L); fp_fill!(s, c, ph, Val(N), Val(W))
+    err = maximum(max(abs(s[i] / amp - sin(angles[i])), abs(c[i] / amp - cos(angles[i]))) for i in eachindex(angles))
+    (ps(mn(@benchmark fp_fill!($s, $c, $ph, $(Val(N)), $(Val(W))))), err)
+end
+
+row(nm, t, e) = @printf("  %-28s %8s %12.2e\n", nm, t, e)
+@printf("%-30s %8s %12s\n", "kernel: sin & cos for L inputs", "ps/elem", "max abs err")
+
+println("== AVX-512 ==")
+for (nm, f) in (("FastSinCos u35", fast_sincos_u35), ("FastSinCos u100k", fast_sincos_u100k))
+    t, e = run_fs(f, 16); row(nm, t, e)
+end
+for (nm, T, N, W) in (("FixedPoint Int32 Val14", Int32, 14, 16),
+                      ("FixedPoint Int16 Val7", Int16, 7, 32),
+                      ("FixedPoint Int32 Val8", Int32, 8, 16))
+    t, e = run_fp(T, N, W); row(nm, t, e)
+end
+for (nm, T, st) in (("SinCosLUT Int8 steps=128", Int8, 128), ("SinCosLUT Int8 steps=64", Int8, 64))
+    t, e = run_scl(T, st, AVX512()); row(nm, t, e)
+end
+
+println("== AVX2 ==")
+for (nm, f) in (("FastSinCos u35", fast_sincos_u35), ("FastSinCos u100k", fast_sincos_u100k))
+    t, e = run_fs(f, 8); row(nm, t, e)
+end
+for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 16), ("FixedPoint Int32 Val8", Int32, 8, 8))
+    t, e = run_fp(T, N, W); row(nm, t, e)
+end
+let (t, e) = run_scl(Int8, 64, AVX2()); row("SinCosLUT Int8 steps=64", t, e) end
