@@ -33,10 +33,16 @@ The lookup primitive is chosen automatically from the CPU:
 | NEON     | `tbl` (`tbl4`)     | Int8 only    | AArch64; 16 lanes |
 | portable | scalar             | Int8/16/32   | always available |
 
+**AVX2 (and NEON) is `Int8`-only.** AVX2's only register-resident table permute is
+`vpshufb`, a *byte* shuffle — there is no word/dword permute (`vpermw`/`vpermd` are
+AVX-512). So on AVX2/NEON the SIMD lookup is implemented for `Int8` (`steps = 64`) only;
+`Int16`/`Int32` silently fall back to the scalar **portable** backend (correct, but not
+vectorised). If you need more amplitude bits on an AVX2 host, prefer a polynomial package
+(FixedPoint/FastSinCos) over a wider SinCosLUT element type.
+
 **SVE2 is not supported.** Julia cannot express LLVM scalable vectors
 (`<vscale x N x T>`), see [JuliaLang/julia#40308](https://github.com/JuliaLang/julia/issues/40308).
-NEON `tbl` runs natively on SVE hardware regardless. On AVX2/NEON, `Int16`/`Int32`
-fall back to the portable backend (no word/dword table permute available there).
+NEON `tbl` runs natively on SVE hardware regardless.
 
 ## Usage
 
