@@ -1,0 +1,17 @@
+name = "SinCosLUT"
+uuid = "59c743cf-042e-44de-8bbe-9da51d41dc19"
+authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
+version = "0.1.0"
+
+[deps]
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
+
+[compat]
+SIMD = "3"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
