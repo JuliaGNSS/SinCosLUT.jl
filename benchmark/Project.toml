@@ -15,4 +15,4 @@ SinCosLUT = {path = ".."}
 # LoopVectorization, which is unsatisfiable on recent Julia.
 [compat]
 FastSinCos = "1"
-FixedPointSinCosApproximations = "1"
+FixedPointSinCosApproximations = "1.1"

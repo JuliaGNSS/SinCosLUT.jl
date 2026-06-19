@@ -15,6 +15,10 @@ Pkg.activate(@__DIR__)
 Pkg.instantiate()   # installs all deps (SinCosLUT via its [sources] path entry)
 using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, SIMD, BenchmarkTools, Printf
 using SinCosLUT: AVX512, AVX2
+# generate_carrier! / cycles_per_sample are exported by both LUT and FixedPoint packages,
+# so qualify them in the end-to-end carrier section below.
+import SinCosLUT as SL
+import FixedPointSinCosApproximations as FP
 
 const L = 16384
 const angles = Float32.((0:L-1) .* (2π * 7 / L))   # several cycles of continuous radians
@@ -50,6 +54,46 @@ function run_fp(T, N, W)
     (ps(mn(@benchmark fp_fill!($s, $c, $ph, $(Val(N)), $(Val(W))))), err)
 end
 
+# ===== End-to-end carrier: phase GENERATION + sincos =====
+# The kernel rows above feed pre-computed phases. Here each package generates the carrier
+# itself — this is where FixedPoint's drift-free integer DDA (multiplicative-inverse phase
+# init) shows up; the kernel rows are unaffected by it. All three run at the same
+# normalised frequency.
+const CARRIER_CYC = 0.01    # cycles/sample
+true_sin(i) = sin(2π * CARRIER_CYC * (i - 1))
+true_cos(i) = cos(2π * CARRIER_CYC * (i - 1))
+
+function run_fp_carrier(T, N, W)
+    s = Vector{T}(undef, L); c = Vector{T}(undef, L); amp = 2.0^N
+    FP.generate_carrier!(s, c, Val(N), CARRIER_CYC; lanes = Val(W))
+    err = maximum(max(abs(s[i] / amp - true_sin(i)), abs(c[i] / amp - true_cos(i))) for i in 1:L)
+    (ps(mn(@benchmark FP.generate_carrier!($s, $c, $(Val(N)), $CARRIER_CYC; lanes = $(Val(W))))), err)
+end
+
+function run_scl_carrier(T, steps, backend)
+    tbl = SL.SinCosTable(T; steps = steps); amp = Float64(typemax(T))
+    s = Vector{T}(undef, L); c = Vector{T}(undef, L)
+    SL.generate_carrier!(s, c, tbl, CARRIER_CYC; backend = backend)
+    err = maximum(max(abs(s[i] / amp - true_sin(i)), abs(c[i] / amp - true_cos(i))) for i in 1:L)
+    (ps(mn(@benchmark SL.generate_carrier!($s, $c, $tbl, $CARRIER_CYC; backend = $backend))), err)
+end
+
+# FastSinCos has no carrier API; generate the phase with an incremental Float32 accumulator
+# (the standard fast approach) and call the kernel.
+function fs_carrier!(re, im, f, ::Val{W}) where {W}
+    step = Float32(2π * CARRIER_CYC)
+    acc = Vec{W,Float32}(ntuple(j -> Float32(j - 1) * step, Val(W)))
+    whole = Float32(W) * step
+    @inbounds for i in 1:W:L
+        s, c = f(acc); l = VecRange{W}(i); im[l] = s; re[l] = c; acc += whole
+    end
+end
+function run_fs_carrier(f, W)
+    re = zeros(Float32, L); im = zeros(Float32, L); fs_carrier!(re, im, f, Val(W))
+    err = maximum(max(abs(im[i] - true_sin(i)), abs(re[i] - true_cos(i))) for i in 1:L)
+    (ps(mn(@benchmark fs_carrier!($re, $im, $f, $(Val(W))))), err)
+end
+
 row(nm, t, e) = @printf("  %-28s %8s %12.2e\n", nm, t, e)
 @printf("%-30s %8s %12s\n", "kernel: sin & cos for L inputs", "ps/elem", "max abs err")
 
@@ -74,3 +118,10 @@ for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 16), ("FixedPoint Int3
     t, e = run_fp(T, N, W); row(nm, t, e)
 end
 let (t, e) = run_scl(Int8, 64, AVX2()); row("SinCosLUT Int8 steps=64", t, e) end
+
+@printf("\nend-to-end carrier (phase gen + sincos), %g cycles/sample, AVX-512\n", CARRIER_CYC)
+let (t, e) = run_scl_carrier(Int8, 64, AVX512()); row("SinCosLUT Int8 steps=64", t, e) end
+for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 32), ("FixedPoint Int32 Val13", Int32, 13, 16))
+    t, e = run_fp_carrier(T, N, W); row(nm, t, e)
+end
+row("FastSinCos u100k (float ph)", run_fs_carrier(fast_sincos_u100k, 16)...)

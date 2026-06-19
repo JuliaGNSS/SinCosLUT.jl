@@ -186,6 +186,23 @@ worst-case absolute error vs the true values, measured on a Zen 5 core. `~bits` 
 | FastSinCos `u35`         | 320 | 6.0e-8 | ~24 |
 | **SinCosLUT** Int8, steps=64 | 346 | 5.2e-2 | ~4 |
 
+**End-to-end carrier** (phase generation + sincos, AVX-512, 0.01 cycles/sample). The
+kernel rows above feed *pre-computed* phases; here each package generates the carrier
+itself. `generate_carrier!` advances the phase with an exact integer DDA (drift-free),
+so this is where FixedPoint's multiplicative-inverse phase work shows — the kernel rows
+are unaffected by it.
+
+| method | ps/elem | max abs error | ~bits |
+| ------ | ------: | ------------: | ----: |
+| **SinCosLUT** Int8, steps=64       | **66**  | 9.3e-2 | ~3  |
+| FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
+| FastSinCos `u100k` (Float32 phase) | 189     | 5.3e-4 | ~11 |
+| FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
+
+FixedPoint's drift-free DDA carrier (131 ps) is only marginally slower than its bare
+kernel (103 ps) — integer phase generation is nearly free — and ~1.4× faster than a
+float-phase FastSinCos carrier (189 ps). SinCosLUT stays fastest but coarsest.
+
 Takeaways:
 
 - **On AVX-512, SinCosLUT is fastest by 3–7×** (one `vpermb` per result) — but only
@@ -196,7 +213,7 @@ Takeaways:
 - Pick by accuracy: **≤5-bit on AVX-512/NEON → SinCosLUT**; **~6–13-bit integer →
   FixedPointSinCosApproximations**; **float-grade (12–24 bit) → FastSinCos**.
 
-(Reproduce with the script in this repo's history, or `bench/` of the sibling packages.)
+(Reproduce both tables with `julia benchmark/comparison.jl`.)
 
 ## Drift-free phase
 
