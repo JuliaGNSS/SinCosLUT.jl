@@ -78,14 +78,15 @@ function run_scl_carrier(T, steps, backend)
     (ps(mn(@benchmark SL.generate_carrier!($s, $c, $tbl, $CARRIER_CYC; backend = $backend))), err)
 end
 
-# FastSinCos has no carrier API; generate the phase with an incremental Float32 accumulator
-# (the standard fast approach) and call the kernel.
+# FastSinCos has no carrier API; generate the phase from the exact integer sample index
+# each chunk (so the float phase doesn't drift — a plain `acc += step` accumulator would,
+# the more so the longer the run / the narrower W) and call the kernel.
 function fs_carrier!(re, im, f, ::Val{W}) where {W}
     step = Float32(2π * CARRIER_CYC)
-    acc = Vec{W,Float32}(ntuple(j -> Float32(j - 1) * step, Val(W)))
-    whole = Float32(W) * step
+    lane = Vec{W,Float32}(ntuple(j -> Float32(j - 1), Val(W)))
     @inbounds for i in 1:W:L
-        s, c = f(acc); l = VecRange{W}(i); im[l] = s; re[l] = c; acc += whole
+        phase = (Float32(i - 1) + lane) * step
+        s, c = f(phase); l = VecRange{W}(i); im[l] = s; re[l] = c
     end
 end
 function run_fs_carrier(f, W)
@@ -125,3 +126,10 @@ for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 32), ("FixedPoint Int3
     t, e = run_fp_carrier(T, N, W); row(nm, t, e)
 end
 row("FastSinCos u100k (float ph)", run_fs_carrier(fast_sincos_u100k, 16)...)
+
+@printf("\nend-to-end carrier (phase gen + sincos), %g cycles/sample, AVX2\n", CARRIER_CYC)
+for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 16), ("FixedPoint Int32 Val13", Int32, 13, 8))
+    t, e = run_fp_carrier(T, N, W); row(nm, t, e)
+end
+row("FastSinCos u100k (float ph)", run_fs_carrier(fast_sincos_u100k, 8)...)
+let (t, e) = run_scl_carrier(Int8, 64, AVX2()); row("SinCosLUT Int8 steps=64", t, e) end
