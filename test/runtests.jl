@@ -147,18 +147,19 @@ end
 
     @testset "iterator is allocation-free & prepare callable" begin
         tbl = SinCosTable(Int8; steps = 64)
-        backend = default_backend(Int8, 64)
-        # width-agnostic reduction (W differs per backend: 64/32/16/1); pass an explicit
-        # backend so the iterator type is concrete on every Julia version.
+        # width-agnostic reduction (W differs per backend: 64/32/16/1). Pass an explicit,
+        # concrete backend so the iterator type is concrete and iteration allocates nothing
+        # on every Julia version. (With the *default* backend, `default_backend` returns an
+        # abstract Union that doesn't always const-fold, so iteration would box per element.)
         reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, 16, 125, n; backend = b); a += sum(s); end; a)
-        reduce_carrier(tbl, backend, 256); reduce_carrier(tbl, backend, 512)   # warm
-        # no PER-ITERATION allocation: doubling the length must not change the byte count
-        @test (@allocated reduce_carrier(tbl, backend, 4096)) == (@allocated reduce_carrier(tbl, backend, 8192))
-        # prepare callable: every lane at index 2 -> table[3], for the backend's width
-        p = prepare(tbl)
-        idx = SIMD.Vec(ntuple(_ -> Int8(2), SinCosLUT._vwidth(backend, Int8)))
-        s, c = p(idx)
-        @test all(==(tbl.sin[3]), Tuple(s)) && all(==(tbl.cos[3]), Tuple(c))
+        @testset "alloc-free with $(backend_name(b))" for b in (default_backend(Int8, 64), Portable())
+            reduce_carrier(tbl, b, 4096)                       # warm (compile)
+            @test (@allocated reduce_carrier(tbl, b, 4096)) == 0
+            # prepare callable: every lane at index 2 -> table[3], for the backend's width
+            p = prepare(tbl; backend = b)
+            s, c = p(SIMD.Vec(ntuple(_ -> Int8(2), SinCosLUT._vwidth(b, Int8))))
+            @test all(==(tbl.sin[3]), Tuple(s)) && all(==(tbl.cos[3]), Tuple(c))
+        end
     end
 
     println("default backends: ",
