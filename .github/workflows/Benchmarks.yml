@@ -1,7 +1,12 @@
 name: Benchmarks
 
+# Uses the official AirspeedVelocity action, which clones the repo, builds the package
+# at the PR base and head, runs benchmark/benchmarks.jl on each, and posts/updates a
+# comparison table as a PR comment. It handles full-history checkout and result dirs
+# internally (no manual benchpkg invocation needed). pull_request_target runs in the
+# base-repo context so the comment-posting token has write permission.
 on:
-  pull_request:
+  pull_request_target:
     branches: [main, master]
 
 concurrency:
@@ -9,54 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  pull-requests: write
+  pull-requests: write    # needed to post the benchmark comment
   contents: read
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: MilesCranmer/AirspeedVelocity.jl@action-v1
         with:
-          version: '1'
-      - uses: julia-actions/cache@v2
-
-      - name: Install AirspeedVelocity
-        run: |
-          julia -e 'using Pkg; Pkg.add("AirspeedVelocity"); Pkg.build("AirspeedVelocity")'
-          echo "${HOME}/.julia/bin" >> "${GITHUB_PATH}"
-
-      # Compare the PR head against the base branch using benchmark/benchmarks.jl
-      - name: Run benchmarks
-        run: |
-          benchpkg \
-            --rev="${{ github.event.pull_request.base.sha }},${{ github.event.pull_request.head.sha }}" \
-            --bench-on="${{ github.event.pull_request.head.sha }}" \
-            --output-dir=results --tune
-
-      - name: Build comparison table
-        run: |
-          echo "## SinCosLUT benchmarks (base → PR)" > table.md
-          echo "" >> table.md
-          benchpkgtable --input-dir=results --ratio >> table.md
-
-      - name: Find previous benchmark comment
-        uses: peter-evans/find-comment@v3
-        id: fc
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: SinCosLUT benchmarks
-
-      - name: Post / update PR comment
-        uses: peter-evans/create-or-update-comment@v4
-        with:
-          comment-id: ${{ steps.fc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body-path: table.md
-          edit-mode: replace
-
-      - name: Also write to job summary
-        if: always()
-        run: cat table.md >> "${GITHUB_STEP_SUMMARY}"
+          julia-version: '1'
