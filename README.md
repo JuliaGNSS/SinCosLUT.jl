@@ -152,6 +152,52 @@ or [FastSinCos.jl](https://github.com/JuliaGNSS/FastSinCos.jl)) is the better to
 this package is for the regime where a tiny register-resident table and one permute
 per result is the win.
 
+## Comparison with FastSinCos.jl and FixedPointSinCosApproximations.jl
+
+Three JuliaGNSS packages compute fast SIMD sin/cos with different speed–accuracy
+trade-offs: this **lookup table**, the float minimax polynomial
+[FastSinCos.jl](https://github.com/JuliaGNSS/FastSinCos.jl), and the integer minimax
+polynomial
+[FixedPointSinCosApproximations.jl](https://github.com/JuliaGNSS/FixedPointSinCosApproximations.jl).
+
+Kernel throughput (computing **both** sin and cos for an array of inputs) and
+worst-case absolute error vs the true values, measured on a Zen 5 core. `~bits` is
+`-log2(max error)`. The `AVX2` block forces the AVX2-width path on the same hardware.
+
+**AVX-512**
+
+| method | ps/elem | max abs error | ~bits |
+| ------ | ------: | ------------: | ----: |
+| **SinCosLUT** Int8, steps=64  | **28**  | 5.2e-2 | ~4  |
+| **SinCosLUT** Int8, steps=128 | **34**  | 2.8e-2 | ~5  |
+| FixedPoint Int16 (Val 7)      | 103     | 1.3e-2 | ~6  |
+| FastSinCos `u100k`            | 187     | 3.2e-4 | ~12 |
+| FixedPoint Int32 (Val 8)      | 206     | 8.1e-3 | ~7  |
+| FastSinCos `u35`              | 226     | 6.0e-8 | ~24 |
+| FixedPoint Int32 (Val 14)     | 293     | 1.1e-4 | ~13 |
+
+**AVX2** (no native cross-lane byte permute — `vpermb` is unavailable)
+
+| method | ps/elem | max abs error | ~bits |
+| ------ | ------: | ------------: | ----: |
+| FixedPoint Int16 (Val 7) | 123 | 1.3e-2 | ~6  |
+| FixedPoint Int32 (Val 8) | 246 | 8.1e-3 | ~7  |
+| FastSinCos `u100k`       | 250 | 3.2e-4 | ~12 |
+| FastSinCos `u35`         | 320 | 6.0e-8 | ~24 |
+| **SinCosLUT** Int8, steps=64 | 346 | 5.2e-2 | ~4 |
+
+Takeaways:
+
+- **On AVX-512, SinCosLUT is fastest by 3–7×** (one `vpermb` per result) — but only
+  ~4–5 bits accurate, set by the table's phase resolution.
+- **On AVX2, SinCosLUT loses its edge**: with no native byte permute the lookup is
+  emulated with a four-way `vpshufb`+blend split and is *slower* than either
+  polynomial package. On AVX2 (and Haswell), prefer FixedPoint or FastSinCos.
+- Pick by accuracy: **≤5-bit on AVX-512/NEON → SinCosLUT**; **~6–13-bit integer →
+  FixedPointSinCosApproximations**; **float-grade (12–24 bit) → FastSinCos**.
+
+(Reproduce with the script in this repo's history, or `bench/` of the sibling packages.)
+
 ## Drift-free phase
 
 `generate_carrier!` advances the phase with an exact integer DDA (`index = div(i·P, Q) mod
