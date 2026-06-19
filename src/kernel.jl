@@ -172,3 +172,16 @@ end
     end
     sin_out, cos_out
 end
+
+# ===== Portable iterator support =====
+# The iterators (generate_carrier/generate_carrier4) are SIMD-first, but must still
+# work on any CPU/type combo that resolves to the Portable backend (e.g. Int16/Int32
+# on AVX2 or NEON). Use width 1 (Vec{1,T}) with a scalar table lookup — correct, just
+# not vectorised. (The array kernels generate_carrier!/lookup_sincos! already have
+# dedicated scalar Portable paths.)
+_vwidth(::Portable, ::Type{T}) where {T} = Val(1)
+@inline _prepare(::Portable, table::SinCosTable) = (table.sin, table.cos)
+@inline function _apply(::Portable, tables, index::Vec{1,T}) where {T}
+    k = Int(index[1]) + 1
+    @inbounds (Vec{1,T}(tables[1][k]), Vec{1,T}(tables[2][k]))
+end

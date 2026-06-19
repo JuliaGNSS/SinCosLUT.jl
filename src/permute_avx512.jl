@@ -22,13 +22,35 @@
         Tuple{UInt32,UInt32,UInt32,UInt32}, Tuple{UInt32,UInt32}, leaf, subleaf)
 end
 @inline _bit(x::UInt32, n) = (x >> n) & 0x1 == 0x1
+
+# XCR0 (low 32 bits) via xgetbv with ecx=0 — tells us which vector state the OS has
+# enabled. A CPUID feature bit alone is not enough: a hypervisor can expose AVX-512 in
+# CPUID without enabling ZMM state, and then LLVM/Julia codegen cannot use it either.
+@inline _xcr0() = Base.llvmcall(
+    """
+    %r = call i32 asm sideeffect "xgetbv", "={ax},{cx},~{dx},~{dirflag},~{fpsr},~{flags}"(i32 %0)
+    ret i32 %r
+    """, UInt32, Tuple{UInt32}, UInt32(0))
+
 function _x86_features()
-    _, ebx, ecx, _ = _cpuid(UInt32(7), UInt32(0))
-    (avx2       = _bit(ebx, 5),
-     avx512f    = _bit(ebx, 16),
-     avx512bw   = _bit(ebx, 30),
-     avx512vbmi = _bit(ecx, 1))
+    _, _, ecx1, _ = _cpuid(UInt32(1), UInt32(0))     # leaf 1: OSXSAVE in ECX bit 27
+    osxsave = _bit(ecx1, 27)
+    xcr0 = osxsave ? _xcr0() : UInt32(0)
+    avx_os    = osxsave && _bit(xcr0, 1) && _bit(xcr0, 2)                      # SSE + YMM state
+    avx512_os = avx_os  && _bit(xcr0, 5) && _bit(xcr0, 6) && _bit(xcr0, 7)    # opmask + ZMM state
+    _, ebx, ecx, _ = _cpuid(UInt32(7), UInt32(0))    # leaf 7: feature bits
+    (avx2       = avx_os    && _bit(ebx, 5),
+     avx512f    = avx512_os && _bit(ebx, 16),
+     avx512bw   = avx512_os && _bit(ebx, 30),
+     avx512vbmi = avx512_os && _bit(ecx, 1))
 end
+
+# Detect ONCE at precompile and bake into a const (like VectorizationBase.jl), so
+# `default_backend` is a pure function of compile-time constants and folds to a
+# concrete backend type — keeping default-backend iteration allocation-free. The
+# const reflects the build machine; Julia keys pkgimages on the CPU target, so a
+# different host re-precompiles and re-detects.
+const HOST_FEATURES = _x86_features()
 
 _llvmtype(::Type{Int8}) = "i8"; _llvmtype(::Type{Int16}) = "i16"; _llvmtype(::Type{Int32}) = "i32"
 # Generate explicit @inline permute methods per element type. (A @generated

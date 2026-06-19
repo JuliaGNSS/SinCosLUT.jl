@@ -85,7 +85,7 @@ include("iterate.jl")
                       (features.avx512f   && (steps == 16 || steps == 32))
     end
     function default_backend(::Type{T}, steps::Integer) where T
-        features = _x86_features()
+        features = HOST_FEATURES   # const (detected at precompile) → foldable, type-stable
         _avx512_supports(T, steps, features) ? AVX512() :
         (T === Int8 && features.avx2 && steps == 64) ? AVX2() : Portable()
     end
