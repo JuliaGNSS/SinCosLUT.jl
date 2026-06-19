@@ -14,7 +14,7 @@ declare <16 x i8> @llvm.aarch64.neon.tbl4(<16 x i8>, <16 x i8>, <16 x i8>, <16 x
 define <16 x i8> @entry(<16 x i8> %a, <16 x i8> %b, <16 x i8> %c, <16 x i8> %d, <16 x i8> %i) #0 {
   %r = call <16 x i8> @llvm.aarch64.neon.tbl4(<16 x i8> %a, <16 x i8> %b, <16 x i8> %c, <16 x i8> %d, <16 x i8> %i)
   ret <16 x i8> %r }
-attributes #0 = { "target-features"="+neon" }
+attributes #0 = { alwaysinline "target-features"="+neon" }
 """
 @inline function _tbl4(part0::Vec{16,Int8}, part1::Vec{16,Int8}, part2::Vec{16,Int8},
                        part3::Vec{16,Int8}, index::Vec{16,Int8})

@@ -2,13 +2,19 @@
 # AVX2, so split the 6-bit index into four in-lane 16-entry shuffles + blends).
 # Int16/Int32 have no AVX2 word/dword table permute here → handled by the portable
 # backend.
+#
+# Every llvmcall IR module below MUST carry `alwaysinline` on its entry function:
+# the (module, "entry") form of llvmcall otherwise emits a real `call` (with a full
+# register spill/reload around it) rather than the bare instruction. With ~14
+# shuffle/blend ops per `_apply`, that call+spill overhead dominated — `alwaysinline`
+# folds each wrapper back to a single instruction and is worth ~8× on this backend.
 
 const _PSHUFB_IR = """
 declare <32 x i8> @llvm.x86.avx2.pshuf.b(<32 x i8>, <32 x i8>)
 define <32 x i8> @entry(<32 x i8> %t, <32 x i8> %i) #0 {
   %r = call <32 x i8> @llvm.x86.avx2.pshuf.b(<32 x i8> %t, <32 x i8> %i)
   ret <32 x i8> %r }
-attributes #0 = { "target-features"="+avx2" }
+attributes #0 = { alwaysinline "target-features"="+avx2" }
 """
 @inline _pshufb(table::Vec{32,Int8}, index::Vec{32,Int8}) =
     Vec{32,Int8}(Base.llvmcall((_PSHUFB_IR, "entry"), NTuple{32,VecElement{Int8}},
@@ -19,7 +25,7 @@ declare <32 x i8> @llvm.x86.avx2.pblendvb(<32 x i8>, <32 x i8>, <32 x i8>)
 define <32 x i8> @entry(<32 x i8> %a, <32 x i8> %b, <32 x i8> %m) #0 {
   %r = call <32 x i8> @llvm.x86.avx2.pblendvb(<32 x i8> %a, <32 x i8> %b, <32 x i8> %m)
   ret <32 x i8> %r }
-attributes #0 = { "target-features"="+avx2" }
+attributes #0 = { alwaysinline "target-features"="+avx2" }
 """
 @inline _pblendvb(a::Vec{32,Int8}, b::Vec{32,Int8}, mask::Vec{32,Int8}) =
     Vec{32,Int8}(Base.llvmcall((_PBLENDVB_IR, "entry"), NTuple{32,VecElement{Int8}},
