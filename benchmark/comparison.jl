@@ -122,6 +122,7 @@ let (t, e) = run_scl(Int8, 64, AVX2()); row("SinCosLUT Int8 steps=64", t, e) end
 
 @printf("\nend-to-end carrier (phase gen + sincos), %g cycles/sample, AVX-512\n", CARRIER_CYC)
 let (t, e) = run_scl_carrier(Int8, 64, AVX512()); row("SinCosLUT Int8 steps=64", t, e) end
+let (t, e) = run_scl_carrier(Int8, 128, AVX512()); row("SinCosLUT Int8 steps=128", t, e) end
 for (nm, T, N, W) in (("FixedPoint Int16 Val7", Int16, 7, 32), ("FixedPoint Int32 Val13", Int32, 13, 16))
     t, e = run_fp_carrier(T, N, W); row(nm, t, e)
 end
