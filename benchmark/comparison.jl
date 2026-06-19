@@ -12,18 +12,7 @@
 
 using Pkg
 Pkg.activate(@__DIR__)
-# First run: set up deps (FastSinCos is unregistered -> add from GitHub; SinCosLUT is
-# this repo).
-try
-    @eval using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, BenchmarkTools, SIMD
-catch
-    Pkg.develop(path = dirname(@__DIR__))               # SinCosLUT (this repo)
-    Pkg.add(["BenchmarkTools", "SIMD"])
-    # FastSinCos is unregistered; FixedPoint's SIMD.Vec support is on master (newer
-    # than the registered release) — pull both from GitHub.
-    Pkg.add(url = "https://github.com/JuliaGNSS/FastSinCos.jl")
-    Pkg.add(url = "https://github.com/JuliaGNSS/FixedPointSinCosApproximations.jl")
-end
+Pkg.instantiate()   # installs all deps, including the [sources] entries (SinCosLUT, FastSinCos)
 using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, SIMD, BenchmarkTools, Printf
 using SinCosLUT: AVX512, AVX2
 
