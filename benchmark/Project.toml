@@ -1,6 +1,8 @@
+# Only registered, conflict-free deps live here. comparison.jl's bootstrap installs the
+# rest on first run: SinCosLUT (this repo, dev'd), FastSinCos (unregistered) and
+# FixedPointSinCosApproximations 0.3.0 — all from GitHub. FixedPoint must NOT be listed
+# here by UUID: its registered release (0.2.2) pulls LoopVectorization (unsatisfiable on
+# recent Julia), and the resolver would pick it before the bootstrap can intervene.
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
-FastSinCos = "eb71ef10-bbd6-487f-97cc-2efbd12ad3c4"
-FixedPointSinCosApproximations = "aedcc28f-63b5-4046-b467-b09cfa7c8db7"
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
-SinCosLUT = "59c743cf-042e-44de-8bbe-9da51d41dc19"
