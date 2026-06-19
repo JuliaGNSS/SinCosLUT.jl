@@ -12,7 +12,7 @@
 
 using Pkg
 Pkg.activate(@__DIR__)
-Pkg.instantiate()   # installs all deps, including the [sources] entries (SinCosLUT, FastSinCos)
+Pkg.instantiate()   # installs all deps (SinCosLUT via its [sources] path entry)
 using SinCosLUT, FastSinCos, FixedPointSinCosApproximations, SIMD, BenchmarkTools, Printf
 using SinCosLUT: AVX512, AVX2
 

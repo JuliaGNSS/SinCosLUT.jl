@@ -5,14 +5,14 @@ FixedPointSinCosApproximations = "aedcc28f-63b5-4046-b467-b09cfa7c8db7"
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
 SinCosLUT = "59c743cf-042e-44de-8bbe-9da51d41dc19"
 
-# Non-registry deps are resolved from here directly (Julia ≥ 1.11), so a bare
-# `Pkg.instantiate()` sets everything up — no manual Pkg.add/develop in comparison.jl.
-# SinCosLUT is this repo; FastSinCos is unregistered.
+# SinCosLUT (this repo) is resolved from its path directly (Julia ≥ 1.11), so a bare
+# `Pkg.instantiate()` sets everything up — no manual Pkg.develop in comparison.jl. All
+# other deps (FastSinCos, FixedPointSinCosApproximations, …) are registered.
 [sources]
-FastSinCos = {url = "https://github.com/JuliaGNSS/FastSinCos.jl"}
 SinCosLUT = {path = ".."}
 
-# Pin FixedPointSinCosApproximations to the SIMD build (≥ 1.0); the 0.2.x line depended
-# on LoopVectorization, which is unsatisfiable on recent Julia.
+# Pin to the SIMD builds (≥ 1.0); the 0.2.x FixedPoint line depended on
+# LoopVectorization, which is unsatisfiable on recent Julia.
 [compat]
+FastSinCos = "1"
 FixedPointSinCosApproximations = "1"
