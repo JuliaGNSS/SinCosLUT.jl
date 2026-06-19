@@ -16,11 +16,14 @@ for (T, steps) in ((Int8, 64), (Int16, 64), (Int32, 32))
 end
 
 # ---- 4-wide interleaved iterator filling arrays (Int8) — the ~40 ps/elem path ----
+# Width is the backend's SIMD width (64 on AVX-512, 32 on AVX2, …), so read it off the
+# yielded Vec rather than hard-coding it — keeps the suite runnable on AVX2-only hosts.
 function _fill4!(sins, coss, tbl)
     i = 1
     @inbounds for q in generate_carrier4(tbl, P, Q, length(sins))
         for (sv, cv) in q
-            sins[VecRange{64}(i)] = sv; coss[VecRange{64}(i)] = cv; i += 64
+            W = length(sv)
+            sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
         end
     end
 end
@@ -32,7 +35,7 @@ end
 function _reduce(tbl)
     acc = 0
     @inbounds for (sv, _) in generate_carrier(tbl, P, Q, L)
-        acc += sum(Vec{64,Int32}(sv))
+        acc += sum(Vec{length(sv),Int32}(sv))
     end
     acc
 end
