@@ -24,3 +24,9 @@ jobs:
       - uses: MilesCranmer/AirspeedVelocity.jl@action-v1
         with:
           julia-version: '1'
+          # Freeze the benchmark script to the PR head, so a PR that changes
+          # benchmark/benchmarks.jl is compared with its *own* suite (otherwise
+          # the action defaults --bench-on to the base branch and a PR's new
+          # benchmarks never appear). Safe under pull_request_target: the action
+          # blanks GITHUB_TOKEN and uses persist-credentials:false while running.
+          bench-on: ${{ github.event.pull_request.head.sha }}
