@@ -4,10 +4,13 @@
 # least-disturbed sample), so it doesn't show phantom regressions when the head
 # build happens to land on a busier runner window.
 #
-# Usage:  julia min_table.jl <input_dir> <pkg> <base_rev> <head_rev>
+# Usage:  julia min_table.jl <input_dir> <pkg> <base_rev> <head_rev> [label]
+# The optional <label> (e.g. the runner OS) is appended to the table heading so a
+# multi-platform matrix can post one distinct comment per platform.
 using JSON3
 
 input_dir, pkg, base_rev, head_rev = ARGS[1], ARGS[2], ARGS[3], ARGS[4]
+label = length(ARGS) >= 5 ? ARGS[5] : ""
 
 readrev(rev) = open(joinpath(input_dir, "results_$(pkg)@$(rev).json"), "r") do io
     JSON3.read(io, Dict{String,Any})
@@ -48,7 +51,9 @@ haskey(base, "time_to_load") && push!(names, "time_to_load")
 headlbl = length(head_rev) >= 8 ? head_rev[1:8] * "…" : head_rev
 
 io = IOBuffer()
-println(io, "## Benchmark Results (minimum time)")
+title = isempty(label) ? "Benchmark Results (minimum time)" :
+                         "Benchmark Results (minimum time) — $label"
+println(io, "## $title")
 println(io)
 println(io, "Reporting the **minimum** over all samples (robust to shared-runner contention), ",
             "not the median. Ratio = $base_rev / $headlbl: **>1 means the PR is faster**. ",
