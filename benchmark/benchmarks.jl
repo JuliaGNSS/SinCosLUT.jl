@@ -4,10 +4,12 @@
 using BenchmarkTools, SinCosLUT, SIMD
 
 # Iterator constructors were renamed generate_carrier(4) → CarrierIterator(4) in v2. Use the
-# v2 names when available, fall back to the pre-v2 names, so this one script runs against
-# both the PR head and the (pre-rename) base in the AirspeedVelocity comparison.
-const _CARRIER  = isdefined(SinCosLUT, :CarrierIterator)  ? SinCosLUT.CarrierIterator  : SinCosLUT.generate_carrier
-const _CARRIER4 = isdefined(SinCosLUT, :CarrierIterator4) ? SinCosLUT.CarrierIterator4 : SinCosLUT.generate_carrier4
+# pre-v2 function name when it still exists (the base rev), else the v2 constructor — so this
+# one script runs against both revs in the AirspeedVelocity comparison. (Discriminate on the
+# old *function* name: the CarrierIterator *struct* already exists on v1.1.0 too, only the
+# constructor moved, so checking for the struct would wrongly pick it on the base.)
+const _CARRIER  = isdefined(SinCosLUT, :generate_carrier)  ? SinCosLUT.generate_carrier  : SinCosLUT.CarrierIterator
+const _CARRIER4 = isdefined(SinCosLUT, :generate_carrier4) ? SinCosLUT.generate_carrier4 : SinCosLUT.CarrierIterator4
 
 const SUITE = BenchmarkGroup()
 # Three buffer sizes probe three regimes:
