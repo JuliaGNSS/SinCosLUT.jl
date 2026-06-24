@@ -64,6 +64,35 @@ end
 #   remainder[j] = mod(step_num*(start_sample+j), step_den),   j = 0..W-1
 # Per-lane reductions use a multiplicative inverse (mul+shift, not idiv); they are
 # independent across lanes so they pipeline (a serial Bresenham fill is slower).
+#
+# Two implementations, dispatched on `T`:
+#  * Int8 (fast SIMD path): build the W lanes with a *vector* mul-inverse instead of W
+#    scalar `div`s. For Int8, step_den ≤ 127 and the init product
+#    p = step_num*(start_sample+j-1) stays < 2^21, so `div(p, step_den)` can be done
+#    exactly as `(p*M) >> K` with K=28, M=⌈2^K/step_den⌉, all inside Int64 (no 128-bit
+#    high-multiply). Bit-identical to the scalar path over the whole Int8 init range.
+#  * Int16/Int32: keep the original scalar `den_inverse` (SignedMultiplicativeInverse)
+#    build — those products do not fit the 2^21 window the magic constant relies on.
+const _MULINV_K = 28   # shift for the Int8 magic-number div: (p*M) >> K == div(p, step_den)
+
+# Constant lane vectors Vec{W,Int64}([0,1,…,W-1]) for each Int8 backend width
+# (64 = AVX-512, 32 = AVX2, 16 = NEON, 1 = Portable). Generic over W via a generated
+# constant so the ntuple folds to a compile-time literal vector.
+@inline @generated _lanes(::Val{W}) where {W} =
+    :(Vec{$W,Int64}($(Expr(:tuple, (Int64(j - 1) for j in 1:W)...))))
+
+# Int8 SIMD init via vector mul-inverse (see comment above).
+@inline function _init_state(::Val{W}, ::Type{Int8}, ::Type{U},
+                             step_num, den_inverse, step_den, start_sample, phase_offset) where {W,U}
+    M     = cld(Int64(1) << _MULINV_K, Int64(step_den))          # ⌈2^K / step_den⌉
+    p     = Vec{W,Int64}(Int64(step_num)) * (_lanes(Val(W)) + Int64(start_sample))
+    idx   = (p * M) >> _MULINV_K                                  # == div(p, step_den) exactly (Int8 range)
+    phase     = convert(Vec{W,Int8}, idx + Int64(phase_offset))  # matches (div + offset) % Int8; lookup masks mod steps
+    remainder = convert(Vec{W,U}, p - idx * Int64(step_den))     # == p mod step_den ≤ 126, fits U = UInt8
+    (phase, remainder)
+end
+
+# Int16/Int32 scalar init (unchanged from the original exact-rational implementation).
 @inline function _init_state(::Val{W}, ::Type{T}, ::Type{U},
                              step_num, den_inverse, step_den, start_sample, phase_offset) where {W,T,U}
     phase     = Vec{W,T}(ntuple(j -> (div(step_num * (start_sample + j - 1), den_inverse) + phase_offset) % T, Val(W)))
