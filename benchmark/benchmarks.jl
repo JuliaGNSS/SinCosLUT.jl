@@ -4,11 +4,12 @@
 using BenchmarkTools, SinCosLUT, SIMD
 
 const SUITE = BenchmarkGroup()
-# Two buffer sizes probe two regimes:
+# Three buffer sizes probe three regimes:
 #   64k → steady-state throughput; the per-call DDA init is amortized away.
-#    4k → short integration (≈ a GNSS 1 ms epoch); init/setup is a real fraction, so
-#         this is where init-path changes actually show up.
-const SIZES = (("64k", 1 << 16), ("4k", 1 << 12))
+#    4k → short integration (≈ a GNSS 1 ms epoch); init/setup is a real fraction.
+#    1k → very short integration; init/setup dominates, so init-path changes show
+#         up most sharply here.
+const SIZES = (("64k", 1 << 16), ("4k", 1 << 12), ("1k", 1 << 10))
 const P, Q = 16, 125       # phase step P/Q steps per sample (≈0.002 cycles/sample at 64 steps)
 
 # ---- array fill (drift-free DDA), per output element type and buffer size ----
