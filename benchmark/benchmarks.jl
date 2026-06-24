@@ -10,14 +10,14 @@ const SUITE = BenchmarkGroup()
 #    1k → very short integration; init/setup dominates, so init-path changes show
 #         up most sharply here.
 const SIZES = (("64k", 1 << 16), ("4k", 1 << 12), ("1k", 1 << 10))
-const P, Q = 16, 125       # phase step P/Q steps per sample (≈0.002 cycles/sample at 64 steps)
+const FREQ_WORD = 0x0a3d70a3   # NCO frequency word (≈0.005 cycles/sample)
 
-# ---- array fill (drift-free DDA), per output element type and buffer size ----
+# ---- array fill (NCO phase accumulator), per output element type and buffer size ----
 SUITE["carrier!"] = BenchmarkGroup()
 for (label, n) in SIZES, (T, steps) in ((Int8, 64), (Int16, 64), (Int32, 32))
     tbl = SinCosTable(T; steps = steps)
     s = zeros(T, n); c = zeros(T, n)
-    SUITE["carrier!"]["$T/$label"] = @benchmarkable generate_carrier!($s, $c, $tbl, $P, $Q)
+    SUITE["carrier!"]["$T/$label"] = @benchmarkable generate_carrier!($s, $c, $tbl, $FREQ_WORD)
 end
 
 # ---- 4-wide interleaved iterator filling arrays (Int8) — the ~40 ps/elem path ----
@@ -25,7 +25,7 @@ end
 # yielded Vec rather than hard-coding it — keeps the suite runnable on AVX2-only hosts.
 function _fill4!(sins, coss, tbl)
     i = 1
-    @inbounds for q in generate_carrier4(tbl, P, Q, length(sins))
+    @inbounds for q in generate_carrier4(tbl, FREQ_WORD, length(sins))
         for (sv, cv) in q
             W = length(sv)
             sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
@@ -42,7 +42,7 @@ end
 # ---- fused, array-free reduction over the single-Vec iterator (Int8) ----
 function _reduce(tbl, n)
     acc = 0
-    @inbounds for (sv, _) in generate_carrier(tbl, P, Q, n)
+    @inbounds for (sv, _) in generate_carrier(tbl, FREQ_WORD, n)
         acc += sum(Vec{length(sv),Int32}(sv))
     end
     acc

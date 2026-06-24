@@ -1,19 +1,30 @@
 using SinCosLUT, Test, SIMD
-using SinCosLUT: Portable, default_backend, backend_name
+using SinCosLUT: Portable, default_backend, backend_name, _phase_steps
 
-# Ground-truth lookup (independent of any SIMD path)
-function ref_carrier(::Type{T}, N, P, Q, L) where T
+# Ground-truth NCO index for sample n (0-based): top log2(N) bits of the UInt32 phase
+# accumulator. acc[n] = freq_word*n + acc_offset (mod 2^32).
+function ref_idx(freq_word::UInt32, N, n; phase = 0)
+    shift = 32 - trailing_zeros(N)
+    acc_offset = UInt32(mod(_phase_steps(phase, N), N) << shift)
+    Int((freq_word * UInt32(n) + acc_offset) >> shift)
+end
+
+# Ground-truth carrier (independent of any SIMD path)
+function ref_carrier(::Type{T}, N, freq_word::UInt32, L; phase = 0) where T
     tbl = SinCosTable(T; steps = N)
     s = zeros(T, L); c = zeros(T, L)
     for i in 1:L
-        k = mod(div(P * (i - 1), Q), N)
+        k = ref_idx(freq_word, N, i - 1; phase = phase)
         s[i] = tbl.sin[k + 1]; c[i] = tbl.cos[k + 1]
     end
     s, c
 end
 
+# NCO frequency word used across the byte-exact tests (≈0.005 cycles/sample).
+const FW = 0x0a3d70a3
+
 # Fused reduction over the iterator (width/type-agnostic via sum(s)).
-reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, 16, 125, n; backend = b); a += sum(s); end; a)
+reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, FW, n; backend = b); a += sum(s); end; a)
 # Measure allocations INSIDE a barrier so `b` is concrete at the @allocated site.
 # (A default-backend value is abstractly typed; on some Julia versions that boxes per
 # element when measured directly. Specialising here gives a true 0.)
@@ -34,58 +45,83 @@ end
 
     cases = ((Int8, (64, 128)), (Int16, (32, 64)), (Int32, (16, 32)))
     L = 1000
-    P, Q = 7, 50            # exact rational step 7/50 table-steps per sample
+    # NCO frequency words to exercise: ≈100 Hz @ 5 MHz, a couple of fine Dopplers, and a
+    # negative (receding) Doppler that wraps through two's complement.
+    fws = (FW,
+           UInt32(round(Int64, 1234.5 / 5e6 * 2.0^32)),
+           UInt32(round(Int64, 12345.678 / 5e6 * 2.0^32)),
+           unsafe_trunc(UInt32, round(Int64, -777.3 / 5e6 * 2.0^32)))  # negative Doppler
 
-    @testset "$T steps=$N — active backend matches reference" for (T, Ns) in cases, N in Ns
+    @testset "$T steps=$N fw=$(repr(fw)) — active backend matches reference" for (T, Ns) in cases, N in Ns, fw in fws
         b = default_backend(T, N)
         tbl = SinCosTable(T; steps = N)
         s = zeros(T, L); c = zeros(T, L)
-        generate_carrier!(s, c, tbl, P, Q; backend = b)
-        sref, cref = ref_carrier(T, N, P, Q, L)
+        generate_carrier!(s, c, tbl, fw; backend = b)
+        sref, cref = ref_carrier(T, N, fw, L)
         @test s == sref
         @test c == cref
     end
 
-    @testset "$T steps=$N — portable matches reference" for (T, Ns) in cases, N in Ns
+    @testset "$T steps=$N fw=$(repr(fw)) — portable matches reference" for (T, Ns) in cases, N in Ns, fw in fws
         tbl = SinCosTable(T; steps = N)
         s = zeros(T, L); c = zeros(T, L)
-        generate_carrier!(s, c, tbl, P, Q; backend = Portable())
-        sref, cref = ref_carrier(T, N, P, Q, L)
+        generate_carrier!(s, c, tbl, fw; backend = Portable())
+        sref, cref = ref_carrier(T, N, fw, L)
         @test s == sref && c == cref
     end
 
     @testset "sincos_lut! matches carrier path" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
-        phases = T[ (div(P * (i - 1), Q) % T) for i in 1:L ]
+        phases = T[ (ref_idx(FW, N, i - 1) % T) for i in 1:L ]
         s = zeros(T, L); c = zeros(T, L)
         lookup_sincos!(s, c, phases, tbl)
-        sref, cref = ref_carrier(T, N, P, Q, L)
+        sref, cref = ref_carrier(T, N, FW, L)
         @test s == sref && c == cref
     end
 
-    @testset "drift-free over long run ($T, N=$N)" for (T, Ns) in cases, N in Ns
+    @testset "no drift over long run ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
         L2 = 200_000
         s = zeros(T, L2); c = zeros(T, L2)
-        generate_carrier!(s, c, tbl, P, Q)               # default backend
-        # phase index must stay exactly div(i*P,Q) mod N for ALL i (no drift)
+        generate_carrier!(s, c, tbl, FW)                 # default backend
+        # phase index must stay exactly the NCO closed form for ALL i (no drift)
         ok = true
         for i in 1:L2
-            k = mod(div(P * (i - 1), Q), N)
+            k = ref_idx(FW, N, i - 1)
             (s[i] == tbl.sin[k + 1] && c[i] == tbl.cos[k + 1]) || (ok = false; break)
         end
         @test ok
     end
 
+    @testset "fine Doppler is dead-zone-free" begin
+        T = Int8; N = 64; fs = 5e6
+        tbl = SinCosTable(T; steps = N)
+        b = default_backend(T, N)
+        out(f, len) = (s = zeros(T, len); c = zeros(T, len);
+                       generate_carrier!(s, c, tbl; frequency = f, sampling_frequency = fs, backend = b); (s, c))
+        s100,  c100  = out(100.0, 4096)
+        s100b, c100b = out(100.001, 4096)   # a 1 mHz Doppler shift must change the output
+        @test (s100, c100) != (s100b, c100b)
+        @test !all(==(s100[1]), s100)       # not stuck at DC
+        # a tiny 0.5 Hz Doppler still advances the NCO phase — given enough samples it must
+        # leave DC (0.5 Hz crosses a 64-step index after ~5e6/(64·0.5) ≈ 156k samples).
+        s05, c05 = out(0.5, 200_000)
+        @test !(all(==(s05[1]), s05) && all(==(c05[1]), c05))
+        # and the frequency word for 0.5 Hz is genuinely nonzero (no dead zone at the low end)
+        @test SinCosLUT._freq_word(0.5 / fs) != 0
+    end
+
     @testset "accuracy vs true sincos (Int16, N=64)" begin
         N = 64; T = Int16; A = typemax(Int16)
         tbl = SinCosTable(T; steps = N)
-        L2 = 4096; P, Q = 1, 13
+        L2 = 4096
+        fw = UInt32(round(Int64, (1 / 13 / N) * 2.0^32))   # ≈ 1/13 table-steps per sample
+        cps = fw / 2.0^32                                   # actual cycles/sample realised
         s = zeros(T, L2); c = zeros(T, L2)
-        generate_carrier!(s, c, tbl, P, Q)
+        generate_carrier!(s, c, tbl, fw)
         maxerr = 0.0
         for i in 1:L2
-            θ = 2pi * (P * (i - 1) / Q) / N
+            θ = 2pi * cps * (i - 1)
             maxerr = max(maxerr, abs(c[i] / A - cos(θ)))
         end
         @test maxerr < 0.11          # 64 phase steps, floored: error ≲ one step ≈ π/64 ≈ 0.098
@@ -93,11 +129,11 @@ end
 
     @testset "iterator == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
-        sref, cref = ref_carrier(T, N, P, Q, L)
+        sref, cref = ref_carrier(T, N, FW, L)
         W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
         nfull = (L ÷ W) * W
         s = zeros(T, L); c = zeros(T, L); i = 1
-        for (sv, cv) in generate_carrier(tbl, P, Q, L)
+        for (sv, cv) in generate_carrier(tbl, FW, L)
             s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
         end
         @test s[1:nfull] == sref[1:nfull]
@@ -106,11 +142,11 @@ end
 
     @testset "carrier4 == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
-        sref, cref = ref_carrier(T, N, P, Q, L)
+        sref, cref = ref_carrier(T, N, FW, L)
         W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
         nfull = (L ÷ (4W)) * (4W)
         s = zeros(T, L); c = zeros(T, L); i = 1
-        for quad in generate_carrier4(tbl, P, Q, L)
+        for quad in generate_carrier4(tbl, FW, L)
             for (sv, cv) in quad
                 s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
             end
@@ -123,21 +159,21 @@ end
         tbl = SinCosTable(T; steps = N)
         φ = 7
         s = zeros(T, L); c = zeros(T, L)
-        generate_carrier!(s, c, tbl, P, Q; phase = φ)
-        # output[i] must be the table at (div(i*P,Q) + φ) mod N
+        generate_carrier!(s, c, tbl, FW; phase = φ)
+        # output[i] must be the table at the NCO index with phase offset φ
         ok = true
         for i in 1:L
-            k = mod(div(P * (i - 1), Q) + φ, N)
+            k = ref_idx(FW, N, i - 1; phase = φ)
             (s[i] == tbl.sin[k + 1] && c[i] == tbl.cos[k + 1]) || (ok = false; break)
         end
         @test ok
         # phase = N wraps to phase = 0
-        s0 = zeros(T, L); c0 = zeros(T, L); generate_carrier!(s0, c0, tbl, P, Q)
-        sN = zeros(T, L); cN = zeros(T, L); generate_carrier!(sN, cN, tbl, P, Q; phase = N)
+        s0 = zeros(T, L); c0 = zeros(T, L); generate_carrier!(s0, c0, tbl, FW)
+        sN = zeros(T, L); cN = zeros(T, L); generate_carrier!(sN, cN, tbl, FW; phase = N)
         @test s0 == sN && c0 == cN
         # Real phase in cycles: 0.25 cycles == N÷4 table steps
-        sr = zeros(T, L); cr = zeros(T, L); generate_carrier!(sr, cr, tbl, P, Q; phase = 0.25)
-        si = zeros(T, L); ci = zeros(T, L); generate_carrier!(si, ci, tbl, P, Q; phase = N ÷ 4)
+        sr = zeros(T, L); cr = zeros(T, L); generate_carrier!(sr, cr, tbl, FW; phase = 0.25)
+        si = zeros(T, L); ci = zeros(T, L); generate_carrier!(si, ci, tbl, FW; phase = N ÷ 4)
         @test sr == si && cr == ci
     end
 
