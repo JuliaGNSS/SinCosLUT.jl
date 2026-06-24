@@ -196,16 +196,18 @@ emulated with a four-way `vpshufb`+blend split)
 **End-to-end carrier** (phase generation + sincos, 0.01 cycles/sample). The kernel rows
 above feed *pre-computed* phases; here each package generates the carrier itself. This is
 where FixedPoint's multiplicative-inverse phase work shows — the kernel rows are
-unaffected by it. All three are drift-free: `generate_carrier!` advances the phase with an
-exact integer DDA, and the FastSinCos row computes the Float32 phase from the exact sample
-index (a plain `acc += step` accumulator is a little faster but drifts).
+unaffected by it. SinCosLUT likewise builds its DDA state with a vectorised
+multiplicative-inverse init, so its carrier stays close to its bare kernel
+(≈23 vs ≈13 ps on AVX-512). All three are drift-free: `generate_carrier!` advances the
+phase with an exact integer DDA, and the FastSinCos row computes the Float32 phase from the
+exact sample index (a plain `acc += step` accumulator is a little faster but drifts).
 
 AVX-512:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **45**  | 9.3e-2 | ~3  |
-| **SinCosLUT** Int8, steps=128      | **44**  | 4.3e-2 | ~5  |
+| **SinCosLUT** Int8, steps=64       | **23**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=128      | **22**  | 4.3e-2 | ~5  |
 | FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 235     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
@@ -214,7 +216,7 @@ AVX2:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **62**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=64       | **53**  | 9.3e-2 | ~3  |
 | FixedPoint Int16 (Val 7)           | 142     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 326     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 383     | 2.4e-4 | ~12 |
