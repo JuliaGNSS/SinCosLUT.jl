@@ -64,8 +64,9 @@ generate_carrier!(sins, coss, tbl; frequency = 1000, sampling_frequency = 2e6)  
 # ...or via the cycles_per_sample helper (= frequency / sampling_frequency):
 generate_carrier!(sins, coss, tbl, cycles_per_sample(1000, 2e6))                 # → 0.0005
 
-# ...or an exact rational phase step P/Q table-steps per sample:
-generate_carrier!(sins, coss, tbl, 16, 125)      # 16/125 steps/sample
+# Any frequency resolves on a uniform f_s/2^32 grid (≈0.001 Hz at 5 MHz) — arbitrary
+# Doppler works with no dead-zone near DC and never errors:
+generate_carrier!(sins, coss, tbl; frequency = 1234.567, sampling_frequency = 5e6)
 
 # optional initial carrier phase (default 0): Integer = table steps, Real = cycles
 generate_carrier!(sins, coss, tbl, 0.002; phase = 16)     # 16 table steps  (¼ cycle, 64-step table)
@@ -95,7 +96,7 @@ function correlate(tbl, cps, signal)
 end
 ```
 
-`generate_carrier(table, P, Q, nsamples)` / `generate_carrier(table, cycles_per_sample, nsamples)` yields
+`generate_carrier(table, cycles_per_sample, nsamples)` (or `; frequency, sampling_frequency`) yields
 `nsamples ÷ W` chunks of `(sin, cos)::Tuple{Vec{W,T},Vec{W,T}}` (W = the backend's
 SIMD width). The fused loop above is **0 allocations** and avoids the carrier
 store/reload entirely.
@@ -196,18 +197,19 @@ emulated with a four-way `vpshufb`+blend split)
 **End-to-end carrier** (phase generation + sincos, 0.01 cycles/sample). The kernel rows
 above feed *pre-computed* phases; here each package generates the carrier itself. This is
 where FixedPoint's multiplicative-inverse phase work shows — the kernel rows are
-unaffected by it. SinCosLUT likewise builds its DDA state with a vectorised
-multiplicative-inverse init, so its carrier stays close to its bare kernel
-(≈23 vs ≈13 ps on AVX-512). All three are drift-free: `generate_carrier!` advances the
-phase with an exact integer DDA, and the FastSinCos row computes the Float32 phase from the
-exact sample index (a plain `acc += step` accumulator is a little faster but drifts).
+unaffected by it. SinCosLUT generates the phase with a UInt32 NCO accumulator (one add per
+step, a single multiply to initialise), so its carrier stays close to its bare kernel
+(≈26 vs ≈13 ps on AVX-512). All three are exact in phase: SinCosLUT's accumulator is
+`n·freq_word mod 2^32` (integer, no rounding accumulation), and the FastSinCos row computes
+the Float32 phase from the exact sample index (a plain `acc += step` float accumulator is a
+little faster but drifts).
 
 AVX-512:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **23**  | 9.3e-2 | ~3  |
-| **SinCosLUT** Int8, steps=128      | **22**  | 4.3e-2 | ~5  |
+| **SinCosLUT** Int8, steps=64       | **26**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=128      | **26**  | 4.3e-2 | ~5  |
 | FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 235     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
@@ -216,7 +218,7 @@ AVX2:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **53**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=64       | **62**  | 9.3e-2 | ~3  |
 | FixedPoint Int16 (Val 7)           | 142     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 326     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 383     | 2.4e-4 | ~12 |
@@ -245,7 +247,10 @@ Takeaways:
 
 ## Drift-free phase
 
-`generate_carrier!` advances the phase with an exact integer DDA (`index = div(i·P, Q) mod
-steps`), so the frequency never drifts — even over millions of samples — whereas a
-binary fractional phase accumulator drifts whenever the frequency's denominator is
-not a power of two.
+`generate_carrier!` is a UInt32 NCO: the phase index for sample `n` is
+`(freq_word · n) >> (32 − log2 steps)` with `freq_word = round(f/f_s · 2^32)`, evaluated in
+exact integer arithmetic (the accumulator is `n · freq_word mod 2^32`). The phase therefore
+accumulates **no** rounding error — even over billions of samples — unlike a floating-point
+`acc += step` accumulator. The only residual is that the synthesised frequency is quantised
+to the nearest `f_s / 2^32` (≈ 0.0006 Hz at 5 MHz), a uniform, dead-zone-free grid; that is
+a fixed sub-milliHz frequency offset, not an accumulating drift.
