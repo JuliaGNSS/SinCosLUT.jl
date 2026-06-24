@@ -41,7 +41,7 @@ generate_carrier!(sins, coss, tbl, 0.002)          # drift-free carrier, 0.002 c
 Array-free / fused (returns `Vec`s, like FastSinCos):
 
 ```julia
-for (s, c) in generate_carrier(tbl, 0.002, length(signal))   # s, c :: Vec{W,Int8}
+for (s, c) in CarrierIterator(tbl, 0.002, length(signal))   # s, c :: Vec{W,Int8}
     # consume in registers; no carrier array is allocated
 end
 ```
@@ -58,8 +58,8 @@ SinCosTable
 
 ```@docs
 generate_carrier!
-generate_carrier
-generate_carrier4
+CarrierIterator
+CarrierIterator4
 cycles_per_sample
 ```
 
