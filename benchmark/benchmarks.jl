@@ -1,5 +1,6 @@
 # Benchmark suite for AirspeedVelocity.jl (`benchpkg`).
 # Run locally:  using AirspeedVelocity; or  benchpkg SinCosLUT --rev=dirty
+# (Runs on both x86/AVX and Apple Silicon/NEON via the CI matrix.)
 
 using BenchmarkTools, SinCosLUT, SIMD
 
