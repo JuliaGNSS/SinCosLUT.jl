@@ -1,10 +1,15 @@
 name: Benchmarks
 
-# Uses the official AirspeedVelocity action, which clones the repo, builds the package
-# at the PR base and head, runs benchmark/benchmarks.jl on each, and posts/updates a
-# comparison table as a PR comment. It handles full-history checkout and result dirs
-# internally (no manual benchpkg invocation needed). pull_request_target runs in the
-# base-repo context so the comment-posting token has write permission.
+# Compares the PR head against the default branch with AirspeedVelocity's `benchpkg`,
+# but reports the **minimum** time per benchmark instead of its built-in median table.
+# The minimum is far more robust to noisy-neighbour contention on shared GitHub runners
+# (it captures the least-disturbed sample), so it doesn't manufacture phantom regressions
+# when the head build lands on a busier runner window.
+#
+# Security: runs as pull_request_target so the comment-posting token has write access.
+# The repo is checked out at the *base* (trusted) ref, and benchpkg benchmarks the PR's
+# own benchmark/benchmarks.jl via --bench-on=<head sha>. GITHUB_TOKEN is blanked for
+# every step that builds/executes benchmark code; only the comment steps see the token.
 on:
   pull_request_target:
     branches: [main, master]
@@ -14,19 +19,70 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  pull-requests: write    # needed to post the benchmark comment
+  pull-requests: write
   contents: read
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
     steps:
-      - uses: MilesCranmer/AirspeedVelocity.jl@action-v1
+      # Base (trusted) checkout — provides .github/scripts/min_table.jl. The PR's own
+      # code is fetched separately by benchpkg via --url, not checked out here.
+      - uses: actions/checkout@v6
         with:
-          julia-version: '1'
-          # Freeze the benchmark script to the PR head, so a PR that changes
-          # benchmark/benchmarks.jl is compared with its *own* suite (otherwise
-          # the action defaults --bench-on to the base branch and a PR's new
-          # benchmarks never appear). Safe under pull_request_target: the action
-          # blanks GITHUB_TOKEN and uses persist-credentials:false while running.
-          bench-on: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: julia-actions/setup-julia@v2
+        env:
+          GITHUB_TOKEN: ""
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+        env:
+          GITHUB_TOKEN: ""
+
+      - name: Install benchpkg + JSON3
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          export JULIA_PKG_PRECOMPILE_AUTO=0
+          julia -e 'import Pkg; Pkg.add(name="AirspeedVelocity", version="0.6"); Pkg.add("JSON3")'
+          julia -e 'import Pkg; Pkg.build("AirspeedVelocity")'
+          echo "$HOME/.julia/bin" >> "$GITHUB_PATH"
+
+      - name: Run benchmarks (base vs PR head, using the PR's benchmark suite)
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          mkdir -p results
+          benchpkg SinCosLUT \
+            --url=${{ github.event.repository.clone_url }} \
+            --rev=${{ github.event.repository.default_branch }},${{ github.event.pull_request.head.sha }} \
+            --bench-on=${{ github.event.pull_request.head.sha }} \
+            --output-dir=results/ \
+            --tune
+
+      - name: Build minimum-time comparison table
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          julia .github/scripts/min_table.jl results SinCosLUT \
+            "${{ github.event.repository.default_branch }}" \
+            "${{ github.event.pull_request.head.sha }}" > body.md
+          cat body.md
+
+      - name: Find existing benchmark comment
+        uses: peter-evans/find-comment@v4
+        id: find
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: "Benchmark Results (minimum time)"
+
+      - name: Create or update comment
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: body.md
+          edit-mode: replace
