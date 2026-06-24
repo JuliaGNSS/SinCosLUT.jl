@@ -20,7 +20,7 @@ module SinCosLUT
 
 using SIMD
 
-export SinCosTable, generate_carrier!, generate_carrier, generate_carrier4, lookup_sincos!,
+export SinCosTable, generate_carrier!, CarrierIterator, CarrierIterator4, lookup_sincos!,
        prepare, cycles_per_sample, default_backend, backend_name
 
 # ---- backends ----

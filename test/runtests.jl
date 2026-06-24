@@ -24,7 +24,7 @@ end
 const FW = 0x0a3d70a3
 
 # Fused reduction over the iterator (width/type-agnostic via sum(s)).
-reduce_carrier(t, b, n) = (a = 0; for (s, _) in generate_carrier(t, FW, n; backend = b); a += sum(s); end; a)
+reduce_carrier(t, b, n) = (a = 0; for (s, _) in CarrierIterator(t, FW, n; backend = b); a += sum(s); end; a)
 # Measure allocations INSIDE a barrier so `b` is concrete at the @allocated site.
 # (A default-backend value is abstractly typed; on some Julia versions that boxes per
 # element when measured directly. Specialising here gives a true 0.)
@@ -133,7 +133,7 @@ end
         W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
         nfull = (L ÷ W) * W
         s = zeros(T, L); c = zeros(T, L); i = 1
-        for (sv, cv) in generate_carrier(tbl, FW, L)
+        for (sv, cv) in CarrierIterator(tbl, FW, L)
             s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
         end
         @test s[1:nfull] == sref[1:nfull]
@@ -146,7 +146,7 @@ end
         W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
         nfull = (L ÷ (4W)) * (4W)
         s = zeros(T, L); c = zeros(T, L); i = 1
-        for quad in generate_carrier4(tbl, FW, L)
+        for quad in CarrierIterator4(tbl, FW, L)
             for (sv, cv) in quad
                 s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
             end

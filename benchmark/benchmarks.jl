@@ -25,7 +25,7 @@ end
 # yielded Vec rather than hard-coding it — keeps the suite runnable on AVX2-only hosts.
 function _fill4!(sins, coss, tbl)
     i = 1
-    @inbounds for q in generate_carrier4(tbl, FREQ_WORD, length(sins))
+    @inbounds for q in CarrierIterator4(tbl, FREQ_WORD, length(sins))
         for (sv, cv) in q
             W = length(sv)
             sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
@@ -42,7 +42,7 @@ end
 # ---- fused, array-free reduction over the single-Vec iterator (Int8) ----
 function _reduce(tbl, n)
     acc = 0
-    @inbounds for (sv, _) in generate_carrier(tbl, FREQ_WORD, n)
+    @inbounds for (sv, _) in CarrierIterator(tbl, FREQ_WORD, n)
         acc += sum(Vec{length(sv),Int32}(sv))
     end
     acc
