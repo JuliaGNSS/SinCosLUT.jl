@@ -126,6 +126,20 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
         acc1 += step_advance; acc2 += step_advance; acc3 += step_advance; acc4 += step_advance
         chunk_start += stride
     end
+    # Leftover < 4W samples: up to 3 full W-blocks as single-stream SIMD before the scalar
+    # tail. Streams 1–3 are already positioned at chunk_start + {0,W,2W}, so reuse them.
+    @inbounds if chunk_start + W <= num_samples
+        s1, c1 = _apply(backend, prepared_table, convert(Vec{W,T}, acc1 >> shift))
+        sin_out[VecRange{W}(chunk_start + 1)] = s1; cos_out[VecRange{W}(chunk_start + 1)] = c1; chunk_start += W
+        if chunk_start + W <= num_samples
+            s2, c2 = _apply(backend, prepared_table, convert(Vec{W,T}, acc2 >> shift))
+            sin_out[VecRange{W}(chunk_start + 1)] = s2; cos_out[VecRange{W}(chunk_start + 1)] = c2; chunk_start += W
+            if chunk_start + W <= num_samples
+                s3, c3 = _apply(backend, prepared_table, convert(Vec{W,T}, acc3 >> shift))
+                sin_out[VecRange{W}(chunk_start + 1)] = s3; cos_out[VecRange{W}(chunk_start + 1)] = c3; chunk_start += W
+            end
+        end
+    end
     _generate_tail!(sin_out, cos_out, table, freq_word, acc_offset, chunk_start + 1)
 end
 
