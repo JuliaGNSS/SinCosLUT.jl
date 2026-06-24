@@ -14,7 +14,7 @@
 
 Normalised frequency `frequency / sampling_frequency` (cycles per sample) — pass the
 result as the frequency argument of [`generate_carrier!`](@ref),
-[`generate_carrier`](@ref) or [`generate_carrier4`](@ref), e.g.
+[`CarrierIterator`](@ref) or [`CarrierIterator4`](@ref), e.g.
 `generate_carrier!(sin_out, cos_out, table, cycles_per_sample(1000, 2e6))`.
 """
 cycles_per_sample(frequency, sampling_frequency) = frequency / sampling_frequency
@@ -200,7 +200,7 @@ end
 end
 
 # ===== Portable iterator support =====
-# The iterators (generate_carrier/generate_carrier4) are SIMD-first, but must still
+# The iterators (CarrierIterator/CarrierIterator4) are SIMD-first, but must still
 # work on any CPU/type combo that resolves to the Portable backend (e.g. Int16/Int32
 # on AVX2 or NEON). Use width 1 (Vec{1,T}) with a scalar table lookup — correct, just
 # not vectorised. (The array kernels generate_carrier!/lookup_sincos! already have
