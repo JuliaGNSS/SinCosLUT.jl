@@ -3,6 +3,12 @@
 
 using BenchmarkTools, SinCosLUT, SIMD
 
+# Iterator constructors were renamed generate_carrier(4) → CarrierIterator(4) in v2. Use the
+# v2 names when available, fall back to the pre-v2 names, so this one script runs against
+# both the PR head and the (pre-rename) base in the AirspeedVelocity comparison.
+const _CARRIER  = isdefined(SinCosLUT, :CarrierIterator)  ? SinCosLUT.CarrierIterator  : SinCosLUT.generate_carrier
+const _CARRIER4 = isdefined(SinCosLUT, :CarrierIterator4) ? SinCosLUT.CarrierIterator4 : SinCosLUT.generate_carrier4
+
 const SUITE = BenchmarkGroup()
 # Three buffer sizes probe three regimes:
 #   64k → steady-state throughput; the per-call DDA init is amortized away.
@@ -25,7 +31,7 @@ end
 # yielded Vec rather than hard-coding it — keeps the suite runnable on AVX2-only hosts.
 function _fill4!(sins, coss, tbl)
     i = 1
-    @inbounds for q in CarrierIterator4(tbl, FREQ_WORD, length(sins))
+    @inbounds for q in _CARRIER4(tbl, FREQ_WORD, length(sins))
         for (sv, cv) in q
             W = length(sv)
             sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
@@ -42,7 +48,7 @@ end
 # ---- fused, array-free reduction over the single-Vec iterator (Int8) ----
 function _reduce(tbl, n)
     acc = 0
-    @inbounds for (sv, _) in CarrierIterator(tbl, FREQ_WORD, n)
+    @inbounds for (sv, _) in _CARRIER(tbl, FREQ_WORD, n)
         acc += sum(Vec{length(sv),Int32}(sv))
     end
     acc
