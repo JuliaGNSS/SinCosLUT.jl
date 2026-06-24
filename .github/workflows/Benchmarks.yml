@@ -24,7 +24,13 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    # Run on both x86 (Ubuntu) and ARM (Apple Silicon: macos-14+ are M-series).
+    # fail-fast: false so a flake on one platform doesn't cancel the other's results.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.runner }}
     steps:
       # Base (trusted) checkout — provides .github/scripts/min_table.jl. The PR's own
       # code is fetched separately by benchpkg via --url, not checked out here.
@@ -68,7 +74,8 @@ jobs:
         run: |
           julia .github/scripts/min_table.jl results SinCosLUT \
             "${{ github.event.repository.default_branch }}" \
-            "${{ github.event.pull_request.head.sha }}" > body.md
+            "${{ github.event.pull_request.head.sha }}" \
+            "${{ matrix.runner }}" > body.md
           cat body.md
 
       - name: Find existing benchmark comment
@@ -77,7 +84,7 @@ jobs:
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: 'github-actions[bot]'
-          body-includes: "Benchmark Results (minimum time)"
+          body-includes: "Benchmark Results (minimum time) — ${{ matrix.runner }}"
 
       - name: Create or update comment
         uses: peter-evans/create-or-update-comment@v5
