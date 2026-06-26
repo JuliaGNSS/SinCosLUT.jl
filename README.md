@@ -108,7 +108,7 @@ store/reload entirely.
 For a trivial consumer (e.g. filling an array) a single stream is latency-bound on its one
 DDA carry chain. Interleave `K` independent streams instead — hold `K` states
 `carrier_state(eng, (k-1)*W)` and advance each by `K` chunks per iteration — so the carry
-chains overlap and it reaches the full loop rate (~40 ps/elem at scale, matching
+chains overlap and it reaches the full loop rate (~17 ps/elem at scale on AVX-512, matching
 `generate_carrier!`), allocation-free:
 
 ```julia
@@ -186,13 +186,13 @@ worst-case absolute error vs the true values, measured on a Zen 5 core. `~bits` 
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64  | **13**  | 5.2e-2 | ~4  |
-| **SinCosLUT** Int8, steps=128 | **13**  | 2.8e-2 | ~5  |
+| **SinCosLUT** Int8, steps=64  | **10**  | 5.2e-2 | ~4  |
+| **SinCosLUT** Int8, steps=128 | **10**  | 2.8e-2 | ~5  |
 | FixedPoint Int16 (Val 7)      | 103     | 1.3e-2 | ~6  |
 | FastSinCos `u100k`            | 187     | 3.2e-4 | ~12 |
 | FixedPoint Int32 (Val 8)      | 206     | 8.1e-3 | ~7  |
-| FastSinCos `u35`              | 226     | 6.0e-8 | ~24 |
-| FixedPoint Int32 (Val 14)     | 293     | 1.1e-4 | ~13 |
+| FastSinCos `u35`              | 227     | 6.0e-8 | ~24 |
+| FixedPoint Int32 (Val 14)     | 292     | 1.1e-4 | ~13 |
 
 **AVX2** (no native cross-lane byte permute — `vpermb` is unavailable; the lookup is
 emulated with a four-way `vpshufb`+blend split)
@@ -201,16 +201,16 @@ emulated with a four-way `vpshufb`+blend split)
 | ------ | ------: | ------------: | ----: |
 | **SinCosLUT** Int8, steps=64 | **43** | 5.2e-2 | ~4 |
 | FixedPoint Int16 (Val 7) | 124 | 1.3e-2 | ~6  |
-| FastSinCos `u100k`       | 251 | 3.2e-4 | ~12 |
+| FastSinCos `u100k`       | 252 | 3.2e-4 | ~12 |
 | FixedPoint Int32 (Val 8) | 247 | 8.1e-3 | ~7  |
-| FastSinCos `u35`         | 322 | 6.0e-8 | ~24 |
+| FastSinCos `u35`         | 320 | 6.0e-8 | ~24 |
 
 **End-to-end carrier** (phase generation + sincos, 0.01 cycles/sample). The kernel rows
 above feed *pre-computed* phases; here each package generates the carrier itself. This is
 where FixedPoint's multiplicative-inverse phase work shows — the kernel rows are
 unaffected by it. SinCosLUT generates the phase with a UInt32 NCO accumulator (one add per
 step, a single multiply to initialise), so its carrier stays close to its bare kernel
-(≈26 vs ≈13 ps on AVX-512). All three are exact in phase: SinCosLUT's accumulator is
+(≈17 vs ≈10 ps on AVX-512). All three are exact in phase: SinCosLUT's accumulator is
 `n·freq_word mod 2^32` (integer, no rounding accumulation), and the FastSinCos row computes
 the Float32 phase from the exact sample index (a plain `acc += step` float accumulator is a
 little faster but drifts).
@@ -219,8 +219,8 @@ AVX-512:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **26**  | 9.3e-2 | ~3  |
-| **SinCosLUT** Int8, steps=128      | **26**  | 4.3e-2 | ~5  |
+| **SinCosLUT** Int8, steps=64       | **17**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=128      | **17**  | 4.3e-2 | ~5  |
 | FixedPoint Int16 (Val 7)           | 131     | 1.5e-2 | ~6  |
 | FastSinCos `u100k` (Float32 phase) | 235     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 317     | 2.4e-4 | ~12 |
@@ -229,9 +229,9 @@ AVX2:
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **62**  | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=64       | **61**  | 9.3e-2 | ~3  |
 | FixedPoint Int16 (Val 7)           | 142     | 1.5e-2 | ~6  |
-| FastSinCos `u100k` (Float32 phase) | 326     | 3.1e-4 | ~12 |
+| FastSinCos `u100k` (Float32 phase) | 325     | 3.1e-4 | ~12 |
 | FixedPoint Int32 (Val 13)          | 383     | 2.4e-4 | ~12 |
 
 FixedPoint's drift-free DDA carrier is only marginally slower than its bare kernel (131 vs
@@ -248,7 +248,7 @@ Takeaways:
 - **SinCosLUT is fastest on both AVX-512 and AVX2** (one `vpermb` per result on AVX-512;
   a four-way `vpshufb`+blend split on AVX2) — but only ~4–5 bits accurate, set by the
   table's phase resolution.
-- **AVX2 is ~3× slower than AVX-512** here (half the lanes, plus the four-way emulation of
+- **AVX2 is ~3.5–4× slower than AVX-512** here (half the lanes, plus the four-way emulation of
   the missing byte permute), but still the fastest option at its accuracy — it is no
   longer beaten by the polynomial packages.
 - Pick by accuracy: **≤5-bit → SinCosLUT** (any of AVX-512/AVX2/NEON); **~6–13-bit integer
