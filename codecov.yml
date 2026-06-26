@@ -1,0 +1,19 @@
+# Coverage of the SIMD permute backends (src/permute_avx512.jl, permute_avx2.jl,
+# permute_neon.jl) is hardware-gated: each backend's code is only *executed* on a CPU that
+# has that instruction set, and the CI runner pool is a heterogeneous mix — GitHub's x86
+# `ubuntu-latest` is sometimes AVX-512 Intel and sometimes AVX2-only AMD (so the AVX-512
+# path is uncovered on an AMD draw), and the ARM coverage upload is occasionally dropped
+# (codecov then reports "N uploads less than BASE"). So both patch coverage and the project
+# total swing with the runner draw, not with code quality. Report coverage for visibility,
+# but don't let these inherently-flaky numbers gate PRs.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+codecov:
+  require_ci_to_pass: true
