@@ -1,5 +1,19 @@
 # Changelog
 
+# [3.0.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v2.0.0...v3.0.0) (2026-06-26)
+
+
+* feat!: value-based CarrierEngine/CarrierState replacing the iterators ([939714f](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/939714f57b68d50df3c8504ca1fdf2ed78693bc2))
+
+
+### BREAKING CHANGES
+
+* `CarrierIterator` and `CarrierIterator4` are removed. Replace
+`for (s,c) in CarrierIterator(table, fw, n)` with a `carrier_engine` + `carrier_state`
++ `carrier_lookup`/`carrier_advance` loop (see the iterate.jl module docstring).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
 # [2.0.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v1.1.0...v2.0.0) (2026-06-25)
 
 
