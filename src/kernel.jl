@@ -76,6 +76,14 @@ end
 # NCO bit-layout helpers. One full UInt32 accumulator = one carrier cycle = N table
 # entries; the index for an accumulator value is its top `log2(N)` bits.
 @inline _index_shift(::Val{N}) where {N} = 32 - trailing_zeros(N)   # compile-time constant
+
+# Extract the table index (top log2(N) bits of each NCO accumulator lane) as a `Vec{W,T}`
+# ready for the permute backend. The generic form is a shift + narrowing `convert`; the
+# AVX-512 Int8 backend overrides this with a cheaper byte-gather (see permute_avx512.jl),
+# since `convert(Vec{64,UInt32}->Int8)` lowers to 4×vpmovdb + 3×insert (7 shuffle-port µops)
+# whereas the index lives entirely in byte 3 of each lane and can be gathered for fewer.
+@inline _phase_index(backend, acc::Vec{W,UInt32}, ::Val{N}, ::Type{T}) where {W,N,T} =
+    convert(Vec{W,T}, acc >> UInt32(_index_shift(Val(N))))
 # Initial-phase offset in accumulator units: po_steps table-steps → top bits.
 @inline _acc_offset(po_steps, ::Val{N}) where {N} = UInt32(mod(po_steps, N) << _index_shift(Val(N)))
 
@@ -101,7 +109,6 @@ function _generate!(sin_out, cos_out, table::SinCosTable{T,N},
 end
 function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
                          freq_word::UInt32, phase_offset, backend, ::Val{W}) where {T,N,W}
-    shift = _index_shift(Val(N))
     acc_offset = _acc_offset(phase_offset, Val(N))
     stride = 4W
     step_advance = freq_word * UInt32(stride)              # accumulator advance per stride
@@ -114,13 +121,13 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
     @inbounds while chunk_start + stride <= num_samples
         # store each result immediately (keep ≤2 result vectors live → no spills);
         # the four lookups are still independent so out-of-order execution overlaps them.
-        sin1, cos1 = _apply(backend, prepared_table, convert(Vec{W,T}, acc1 >> shift))
+        sin1, cos1 = _apply(backend, prepared_table, _phase_index(backend, acc1, Val(N), T))
         sin_out[VecRange{W}(chunk_start + 1)]      = sin1; cos_out[VecRange{W}(chunk_start + 1)]      = cos1
-        sin2, cos2 = _apply(backend, prepared_table, convert(Vec{W,T}, acc2 >> shift))
+        sin2, cos2 = _apply(backend, prepared_table, _phase_index(backend, acc2, Val(N), T))
         sin_out[VecRange{W}(chunk_start + W + 1)]  = sin2; cos_out[VecRange{W}(chunk_start + W + 1)]  = cos2
-        sin3, cos3 = _apply(backend, prepared_table, convert(Vec{W,T}, acc3 >> shift))
+        sin3, cos3 = _apply(backend, prepared_table, _phase_index(backend, acc3, Val(N), T))
         sin_out[VecRange{W}(chunk_start + 2W + 1)] = sin3; cos_out[VecRange{W}(chunk_start + 2W + 1)] = cos3
-        sin4, cos4 = _apply(backend, prepared_table, convert(Vec{W,T}, acc4 >> shift))
+        sin4, cos4 = _apply(backend, prepared_table, _phase_index(backend, acc4, Val(N), T))
         sin_out[VecRange{W}(chunk_start + 3W + 1)] = sin4; cos_out[VecRange{W}(chunk_start + 3W + 1)] = cos4
         acc1 += step_advance; acc2 += step_advance; acc3 += step_advance; acc4 += step_advance
         chunk_start += stride
@@ -128,13 +135,13 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
     # Leftover < 4W samples: up to 3 full W-blocks as single-stream SIMD before the scalar
     # tail. Streams 1–3 are already positioned at chunk_start + {0,W,2W}, so reuse them.
     @inbounds if chunk_start + W <= num_samples
-        s1, c1 = _apply(backend, prepared_table, convert(Vec{W,T}, acc1 >> shift))
+        s1, c1 = _apply(backend, prepared_table, _phase_index(backend, acc1, Val(N), T))
         sin_out[VecRange{W}(chunk_start + 1)] = s1; cos_out[VecRange{W}(chunk_start + 1)] = c1; chunk_start += W
         if chunk_start + W <= num_samples
-            s2, c2 = _apply(backend, prepared_table, convert(Vec{W,T}, acc2 >> shift))
+            s2, c2 = _apply(backend, prepared_table, _phase_index(backend, acc2, Val(N), T))
             sin_out[VecRange{W}(chunk_start + 1)] = s2; cos_out[VecRange{W}(chunk_start + 1)] = c2; chunk_start += W
             if chunk_start + W <= num_samples
-                s3, c3 = _apply(backend, prepared_table, convert(Vec{W,T}, acc3 >> shift))
+                s3, c3 = _apply(backend, prepared_table, _phase_index(backend, acc3, Val(N), T))
                 sin_out[VecRange{W}(chunk_start + 1)] = s3; cos_out[VecRange{W}(chunk_start + 1)] = c3; chunk_start += W
             end
         end
