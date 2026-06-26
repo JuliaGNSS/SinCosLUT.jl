@@ -122,7 +122,7 @@ end
 The `(sin, cos)` chunk at `st`'s current phase. Pure read — does not advance the state.
 """
 @inline carrier_lookup(eng::CarrierEngine{T,N,W}, st::CarrierState{W}) where {T,N,W} =
-    eng.prepared(convert(Vec{W,T}, st.acc >> _index_shift(Val(N))))
+    eng.prepared(_phase_index(eng.prepared.backend, st.acc, Val(N), T))
 
 """
     carrier_advance(eng::CarrierEngine, st::CarrierState, nchunks::Integer) -> CarrierState

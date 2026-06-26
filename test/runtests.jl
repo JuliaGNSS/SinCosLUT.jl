@@ -68,6 +68,29 @@ end
         @test c == cref
     end
 
+    # _phase_index extracts the table index (top log2(N) bits of each UInt32 NCO lane). The
+    # AVX-512 Int8 path takes a byte-gather shortcut instead of a narrowing convert; check it
+    # (and every other backend's generic form) against the shift+mask reference over the full
+    # UInt32 range — including the high-bit patterns a real phase accumulator hits.
+    @testset "_phase_index == shift+mask ($T, N=$N)" for (T, Ns) in cases, N in Ns
+        b = default_backend(T, N)
+        W = carrier_width(carrier_engine(SinCosTable(T; steps = N), FW; backend = b))
+        shift = SinCosLUT._index_shift(Val(N))
+        edge = (typemin(UInt32), typemax(UInt32), UInt32(0), UInt32(N - 1) << shift)
+        accs = Iterators.flatten((
+            (Vec{W,UInt32}(ntuple(_ -> rand(UInt32), W)) for _ in 1:200),
+            (Vec{W,UInt32}(ntuple(_ -> rand(edge), W)) for _ in 1:50),
+        ))
+        ok = true
+        for acc in accs
+            idx = SinCosLUT._phase_index(b, acc, Val(N), T)
+            for i in 1:W
+                (Int(idx[i]) & (N - 1)) == Int((acc[i] >> UInt32(shift)) & UInt32(N - 1)) || (ok = false)
+            end
+        end
+        @test ok
+    end
+
     @testset "$T steps=$N fw=$(repr(fw)) — portable matches reference" for (T, Ns) in cases, N in Ns, fw in fws
         tbl = SinCosTable(T; steps = N)
         s = zeros(T, L); c = zeros(T, L)
