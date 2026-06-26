@@ -80,46 +80,57 @@ lookup_sincos!(sins, coss, phases, tbl)
 ### Array-free / fused generation (returns `Vec`s, like FastSinCos)
 
 To avoid materialising a carrier array (and the cache traffic that comes with it),
-iterate the carrier and consume each `(sin, cos)` SIMD `Vec` in registers. The
-drift-free DDA lives in the (isbits) iteration state, so the loop allocates nothing:
+build a loop-invariant `carrier_engine` once and drive it with isbits `CarrierState`s
+renewed by value each iteration — the drift-free DDA lives in the state, so the loop
+allocates nothing and nothing ever escapes to the heap:
 
 ```julia
 # correlate a carrier against a signal without ever building the carrier array
 function correlate(tbl, cps, signal)
-    acc = 0; i = 1
-    @inbounds for (s, c) in CarrierIterator(tbl, cps, length(signal))   # s, c :: Vec{W,Int8}
-        sg = signal[VecRange{length(s)}(i)]
-        acc += sum(Vec{length(s),Int32}(s) * Vec{length(s),Int32}(sg))
-        i += length(s)
+    eng = carrier_engine(tbl, cps)
+    W = carrier_width(eng); st = carrier_state(eng); acc = 0; i = 1
+    @inbounds for _ in 1:(length(signal) ÷ W)
+        s, c = carrier_lookup(eng, st)             # s, c :: Vec{W,Int8}
+        sg = signal[VecRange{W}(i)]
+        acc += sum(Vec{W,Int32}(s) * Vec{W,Int32}(sg))
+        i += W; st = carrier_advance(eng, st, 1)
     end
     acc
 end
 ```
 
-`CarrierIterator(table, cycles_per_sample, nsamples)` (or `; frequency, sampling_frequency`) yields
-`nsamples ÷ W` chunks of `(sin, cos)::Tuple{Vec{W,T},Vec{W,T}}` (W = the backend's
-SIMD width). The fused loop above is **0 allocations** and avoids the carrier
+`carrier_engine(table, cycles_per_sample)` (or `; frequency, sampling_frequency`) builds
+the engine; `carrier_lookup` returns the `(sin, cos)::Tuple{Vec{W,T},Vec{W,T}}` chunk at
+the current phase (W = the backend's SIMD width) and `carrier_advance(eng, st, nchunks)`
+steps the state forward. The fused loop above is **0 allocations** and avoids the carrier
 store/reload entirely.
 
-For a trivial consumer (e.g. filling an array) the single-Vec iterator is
-latency-bound on its one DDA carry chain. Use **`CarrierIterator4`**, which yields four
-`(sin, cos)` pairs per step from four interleaved DDA states — the carry chains
-overlap and it reaches the full loop rate (~40 ps/elem at scale, matching
+For a trivial consumer (e.g. filling an array) a single stream is latency-bound on its one
+DDA carry chain. Interleave `K` independent streams instead — hold `K` states
+`carrier_state(eng, (k-1)*W)` and advance each by `K` chunks per iteration — so the carry
+chains overlap and it reaches the full loop rate (~40 ps/elem at scale, matching
 `generate_carrier!`), allocation-free:
 
 ```julia
+eng = carrier_engine(tbl, 0.002); W = carrier_width(eng)   # W = 64 on AVX-512
+st0 = carrier_state(eng, 0);  st1 = carrier_state(eng, W)
+st2 = carrier_state(eng, 2W); st3 = carrier_state(eng, 3W)
 i = 1
-for ((s0,c0),(s1,c1),(s2,c2),(s3,c3)) in CarrierIterator4(tbl, 0.002, length(sins))
-    sins[VecRange{64}(i)]     = s0; coss[VecRange{64}(i)]     = c0
-    sins[VecRange{64}(i+64)]  = s1; coss[VecRange{64}(i+64)]  = c1
-    sins[VecRange{64}(i+128)] = s2; coss[VecRange{64}(i+128)] = c2
-    sins[VecRange{64}(i+192)] = s3; coss[VecRange{64}(i+192)] = c3
-    i += 256
+for _ in 1:(length(sins) ÷ (4W))
+    s0,c0 = carrier_lookup(eng, st0); s1,c1 = carrier_lookup(eng, st1)
+    s2,c2 = carrier_lookup(eng, st2); s3,c3 = carrier_lookup(eng, st3)
+    sins[VecRange{W}(i)]      = s0; coss[VecRange{W}(i)]      = c0
+    sins[VecRange{W}(i+W)]    = s1; coss[VecRange{W}(i+W)]    = c1
+    sins[VecRange{W}(i+2W)]   = s2; coss[VecRange{W}(i+2W)]   = c2
+    sins[VecRange{W}(i+3W)]   = s3; coss[VecRange{W}(i+3W)]   = c3
+    i += 4W
+    st0 = carrier_advance(eng, st0, 4); st1 = carrier_advance(eng, st1, 4)
+    st2 = carrier_advance(eng, st2, 4); st3 = carrier_advance(eng, st3, 4)
 end
 ```
 
-Rule of thumb: `CarrierIterator` when fusing into nontrivial work (it borrows your loop's
-ILP); `CarrierIterator4` (or `generate_carrier!`) when the per-sample work is light.
+Rule of thumb: a single stream when fusing into nontrivial work (it borrows your loop's
+ILP); a 4-way interleave (or `generate_carrier!`) when the per-sample work is light.
 
 For the stateless, FastSinCos-style primitive (you supply the phase indices),
 `prepare` builds the register-resident table once and returns a callable:
