@@ -169,6 +169,24 @@ end
         @test c[1:nfull] == cref[1:nfull]
     end
 
+    @testset "scalar base state ($T, N=$N)" for (T, Ns) in cases, N in Ns
+        tbl = SinCosTable(T; steps = N)
+        eng = carrier_engine(tbl, FW); W = carrier_width(eng)
+        # State carries a single scalar phase base, not a W-wide vector.
+        st = carrier_state(eng, 2W; phase = 5)
+        @test st isa SinCosLUT.CarrierState{W}
+        @test st.base isa UInt32
+        @test sizeof(st) == sizeof(UInt32)
+        # base + lane_offset reconstructs the old per-lane accumulator bit-for-bit.
+        acc_offset = SinCosLUT._acc_offset(_phase_steps(5, N), Val(N))
+        ref_acc = SinCosLUT._init_acc(Val(W), eng.freq_word, acc_offset, 2W)
+        @test st.base + eng.lane_offset === ref_acc
+        # advance stays bit-identical to advancing the full accumulator.
+        st2 = carrier_advance(eng, st, 3)
+        ref_acc2 = ref_acc + eng.freq_word * UInt32(3 * W)
+        @test st2.base + eng.lane_offset === ref_acc2
+    end
+
     @testset "starting phase offset ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
         φ = 7

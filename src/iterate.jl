@@ -65,17 +65,24 @@ one [`CarrierState`](@ref) per interleaved stream and drive it with [`carrier_lo
 struct CarrierEngine{T,N,W,Prep}
     prepared::Prep
     freq_word::UInt32
+    # Loop-invariant per-lane phase offset `freq_word·[0,1,…,W-1]`. Added back at lookup
+    # time so each `CarrierState` only has to carry the scalar phase base (see below).
+    lane_offset::Vec{W,UInt32}
 end
 
 """
     CarrierState{W}
 
-Immutable, isbits NCO phase-accumulator state (a `Vec{W,UInt32}`). Created by
-[`carrier_state`](@ref) and renewed by value each iteration via [`carrier_advance`](@ref);
-read with [`carrier_lookup`](@ref). Holds no table data, so it stays in registers.
+Immutable, isbits NCO phase-accumulator state: a single scalar phase base (`UInt32`). The
+per-lane accumulator is `base + eng.lane_offset`, reconstructed at [`carrier_lookup`](@ref)
+time — so a K-way interleaved loop keeps only `K` scalars live instead of `K` wide vectors,
+relieving register pressure in the fused inner loop. Created by [`carrier_state`](@ref) and
+renewed by value each iteration via [`carrier_advance`](@ref). The `{W}` parameter is a
+phantom that keeps a state bound to its engine's lane count. Holds no table data, so it stays
+in registers.
 """
 struct CarrierState{W}
-    acc::Vec{W,UInt32}
+    base::UInt32
 end
 
 """
@@ -100,7 +107,8 @@ carrier_engine(table::SinCosTable; frequency::Real, sampling_frequency::Real, kw
 
 function _make_engine(table::SinCosTable{T,N}, freq_word::UInt32, backend, ::Val{W}) where {T,N,W}
     prepared = Prepared{T,N}(_prepare(backend, table), backend, T(N - 1))
-    CarrierEngine{T,N,W,typeof(prepared)}(prepared, freq_word)
+    lane_offset = Vec{W,UInt32}(freq_word) * _lanes_u32(Val(W))
+    CarrierEngine{T,N,W,typeof(prepared)}(prepared, freq_word, lane_offset)
 end
 
 """
@@ -113,7 +121,9 @@ added to every lane: an `Integer` is table steps, a `Real` is cycles.
 @inline function carrier_state(eng::CarrierEngine{T,N,W}, start::Integer = 0;
                                phase::Real = 0) where {T,N,W}
     acc_offset = _acc_offset(_phase_steps(phase, N), Val(N))
-    CarrierState{W}(_init_acc(Val(W), eng.freq_word, acc_offset, Int(start)))
+    # Lane 0 of `_init_acc`: base = freq_word·start + acc_offset (scalar, mod 2³²). The
+    # per-lane `freq_word·j` term is folded into `eng.lane_offset` at lookup time.
+    CarrierState{W}(eng.freq_word * UInt32(start) + acc_offset)
 end
 
 """
@@ -122,7 +132,7 @@ end
 The `(sin, cos)` chunk at `st`'s current phase. Pure read — does not advance the state.
 """
 @inline carrier_lookup(eng::CarrierEngine{T,N,W}, st::CarrierState{W}) where {T,N,W} =
-    eng.prepared(convert(Vec{W,T}, st.acc >> _index_shift(Val(N))))
+    eng.prepared(convert(Vec{W,T}, (st.base + eng.lane_offset) >> _index_shift(Val(N))))
 
 """
     carrier_advance(eng::CarrierEngine, st::CarrierState, nchunks::Integer) -> CarrierState
@@ -131,7 +141,7 @@ Advance the stream by `nchunks` W-wide chunks (`nchunks·W` samples), returning 
 immutable state. A K-way interleaved loop advances every state by `K` each iteration.
 """
 @inline carrier_advance(eng::CarrierEngine{T,N,W}, st::CarrierState{W}, nchunks::Integer) where {T,N,W} =
-    CarrierState{W}(st.acc + eng.freq_word * UInt32(Int(nchunks) * W))
+    CarrierState{W}(st.base + eng.freq_word * UInt32(Int(nchunks) * W))
 
 """
     carrier_width(eng::CarrierEngine) -> Int
