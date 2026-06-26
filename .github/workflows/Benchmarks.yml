@@ -79,6 +79,28 @@ jobs:
             --output-dir=results/ \
             --tune
 
+      - name: Record host CPU + resolved backend
+        # Load the *base* (trusted) package to print which SIMD backend default_backend
+        # resolves to on this runner, so each comment is unambiguous about whether an x86
+        # run used AVX-512 or AVX2 (GitHub's x86 fleet is a mix of AVX-512 Intel and
+        # AVX2-only AMD) and whether ARM used NEON. Best-effort: never block the comment.
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ""
+        run: |
+          julia --project=@scl_host -e '
+            using Pkg
+            Pkg.develop(path = "."); Pkg.precompile()
+            using SinCosLUT
+            ci = Sys.cpu_info()
+            line = string("> **Host** `", Sys.CPU_NAME, "` · ", strip(ci[1].model),
+                          " · ", length(ci), " cores · resolved backends: ",
+                          "Int8/64 → **", backend_name(default_backend(Int8, 64)), "**, ",
+                          "Int16/64 → ", backend_name(default_backend(Int16, 64)), ", ",
+                          "Int32/32 → ", backend_name(default_backend(Int32, 32)))
+            write("hostinfo.md", line * "\n")
+            println(line)'
+
       - name: Build minimum-time comparison table
         env:
           GITHUB_TOKEN: ""

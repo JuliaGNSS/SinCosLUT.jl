@@ -67,6 +67,15 @@ println(io, "Reporting the **minimum** over all samples (robust to shared-runner
             "one revision (🆕 = new on the PR, 🗑 = removed).")
 println(io)
 
+# Host / resolved-backend line, written by the workflow's "Record host CPU" step (best
+# effort — absent if that step was skipped or failed). It records which CPU the run landed
+# on and which SIMD backend default_backend resolved to, so an x86 result is unambiguous
+# about AVX-512 vs AVX2 (GitHub's fleet is a mix) and ARM about NEON vs portable.
+if isfile("hostinfo.md")
+    println(io, strip(read("hostinfo.md", String)))
+    println(io)
+end
+
 # --- time table ---
 println(io, "<details open><summary>Time benchmarks</summary>")
 println(io)
