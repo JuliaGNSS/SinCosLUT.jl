@@ -105,4 +105,29 @@ end
 
 _vwidth(::AVX512, ::Type{T}) where T = Val(regsize(T))
 
+# Fast Int8 phase→index extraction (overrides the generic shift+convert in kernel.jl).
+# `convert(Vec{64,UInt32} -> Int8)` lowers to 4×vpmovdb + 3×inserts (7 shuffle-port µops),
+# and the shuffle port is the bottleneck of both the value-based carrier loop and the fill.
+# The table index is the top log2(N) bits of each lane, which sit entirely in byte 3 of the
+# little-endian UInt32. Gather byte 3 of all 64 lanes with two `vpermi2b` over the accumulator's
+# four byte-quarters (the quarter splits are free sub-register selects) plus one merge — 3
+# shuffle-port µops — then right-align (index = byte3 >> (8-log2(N)) = byte3 >> (index_shift-24))
+# and mask to N-1. The byte shift can bleed a neighbour lane's low bits into bits ≥ log2(N);
+# the `& (N-1)` clears them, so the result is exact. The gather index selects vpermi2b's
+# 0–63 = first operand, 64–127 = second; lanes 32–63 are don't-care (overwritten by the merge).
+@inline function _phase_index(::AVX512, acc::Vec{64,UInt32}, ::Val{N}, ::Type{Int8}) where {N}
+    b = reinterpret(Vec{256,Int8}, acc)
+    q0 = shufflevector(b, Val(ntuple(i -> i - 1, Val(64))))
+    q1 = shufflevector(b, Val(ntuple(i -> i + 63, Val(64))))
+    q2 = shufflevector(b, Val(ntuple(i -> i + 127, Val(64))))
+    q3 = shufflevector(b, Val(ntuple(i -> i + 191, Val(64))))
+    gather = Vec{64,Int8}(ntuple(
+        k -> k <= 16 ? Int8(4 * (k - 1) + 3) : (k <= 32 ? Int8(64 + 4 * (k - 17) + 3) : Int8(0)),
+        Val(64)))
+    lo = _permi2(q0, gather, q1)                         # lanes 0..31 = byte 3 of dwords 0..31
+    hi = _permi2(q2, gather, q3)                         # lanes 0..31 = byte 3 of dwords 32..63
+    msbyte = shufflevector(lo, hi, Val(ntuple(k -> k <= 32 ? k - 1 : 64 + (k - 33), Val(64))))
+    reinterpret(Vec{64,Int8}, (msbyte >> UInt8(_index_shift(Val(N)) - 24)) & UInt8(N - 1))
+end
+
 end # @static x86
