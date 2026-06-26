@@ -6,9 +6,14 @@ on:
     tags: ['*']
   pull_request:
 
+# Deploying builds (the `main` push and every tag push) all write to the same `gh-pages`
+# branch, so they must NOT run concurrently — a tagged release fires the branch build and the
+# tag build at once, and the second `git push` to `gh-pages` is rejected ("cannot lock ref").
+# Route all deploys into one serialized, non-cancelling group so they queue and both finish;
+# keep PR preview builds ref-scoped and cancellable (a new push supersedes the stale preview).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   docs:
