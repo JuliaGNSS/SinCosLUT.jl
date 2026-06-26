@@ -38,11 +38,16 @@ sins = zeros(Int8, 4096); coss = zeros(Int8, 4096)
 generate_carrier!(sins, coss, tbl, 0.002)          # drift-free carrier, 0.002 cycles/sample
 ```
 
-Array-free / fused (returns `Vec`s, like FastSinCos):
+Array-free / fused (returns `Vec`s, like FastSinCos). Build a loop-invariant
+`carrier_engine` once, then renew an isbits `CarrierState` by value each iteration —
+nothing is written to memory:
 
 ```julia
-for (s, c) in CarrierIterator(tbl, 0.002, length(signal))   # s, c :: Vec{W,Int8}
-    # consume in registers; no carrier array is allocated
+eng = carrier_engine(tbl, 0.002)            # 0.002 cycles/sample
+st  = carrier_state(eng)                    # one stream, starting at sample 0
+for _ in 1:(length(signal) ÷ carrier_width(eng))
+    s, c = carrier_lookup(eng, st)          # s, c :: Vec{W,Int8}, consumed in registers
+    st   = carrier_advance(eng, st, 1)      # next W-wide chunk; no carrier array allocated
 end
 ```
 
@@ -58,9 +63,24 @@ SinCosTable
 
 ```@docs
 generate_carrier!
-CarrierIterator
-CarrierIterator4
 cycles_per_sample
+```
+
+### Value-based carrier engine
+
+Allocation-free, register-resident NCO carrier for fusing into a correlation loop: a
+loop-invariant [`CarrierEngine`](@ref) plus an isbits [`CarrierState`](@ref) renewed by
+value each iteration. One engine/state pair serves any interleave factor `K` — hold `K`
+states `carrier_state(eng, (k-1)*W)` and advance each by `K` chunks per iteration.
+
+```@docs
+CarrierEngine
+CarrierState
+carrier_engine
+carrier_state
+carrier_lookup
+carrier_advance
+carrier_width
 ```
 
 ### Lookup primitives

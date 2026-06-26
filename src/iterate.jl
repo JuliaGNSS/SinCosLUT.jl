@@ -4,14 +4,24 @@
 # — the direct analogue of FastSinCos's `fast_sincos_*(::Vec)`, but backed by a
 # register-resident table (built once).
 #
-# `CarrierIterator(table, …, num_samples)` is an iterator yielding `(sin, cos)` `Vec`s
-# with a textbook NCO phase accumulator (UInt32) carried in the (isbits) iteration
-# state. Fuse it straight into your own loop — the carrier is never written to memory:
+# For fused, allocation-free carrier wipe-off, use the value-based NCO API: build a
+# loop-invariant `CarrierEngine` once, create one isbits `CarrierState` per interleaved
+# stream, then per loop iteration look the (sin, cos) up and renew the state by value.
+# Nothing is ever written to memory and nothing escapes to the heap:
 #
-#     accumulator = zero(...)
-#     for (sin_vec, cos_vec) in CarrierIterator(table, 0.002, length(signal))
-#         accumulator += dot_into_registers(sin_vec, cos_vec, ...)   # Vec{W,T}
+#     eng = carrier_engine(table; frequency = 1000, sampling_frequency = 2e6)
+#     st  = carrier_state(eng)                       # one stream, starting at sample 0
+#     acc = zero(...)
+#     for _ in 1:(length(signal) ÷ W)
+#         sin_vec, cos_vec = carrier_lookup(eng, st)
+#         acc += dot_into_registers(sin_vec, cos_vec, ...)
+#         st = carrier_advance(eng, st, 1)           # next W-wide chunk
 #     end
+#
+# The faster K-way *interleaved* loop (independent NCO carry chains overlap → full ILP)
+# just holds K states `carrier_state(eng, (k-1)*W)` and advances each by `K` chunks per
+# iteration — see `carrier_advance`. This replaces the old `CarrierIterator` (K=1) /
+# `CarrierIterator4` (K=4) split with one engine that supports any interleave factor.
 
 # ---- stateless primitive: prepare once, then map Vec -> (Vec, Vec) ----
 struct Prepared{T,N,Backend,TableRegisters}
@@ -35,131 +45,97 @@ prepare(table::SinCosTable{T,N}; backend::Backend = default_backend(T, N)) where
 @inline (p::Prepared{T,N})(phase_index::Vec{W,T}) where {T,N,W} =
     _apply(p.backend, p.table_registers, phase_index & p.index_mask)
 
-# ---- stateful iterator: NCO phase accumulator, yields (sin, cos) Vecs ----
-struct CarrierIterator{T,N,W,Prep}
+# ─────────────────────────────────────────────────────────────────────────────
+# Value-based NCO carrier: a loop-invariant `CarrierEngine` (the register-resident table
+# + the NCO frequency word) plus an isbits `CarrierState` (the phase accumulator) renewed
+# by value every iteration. Both are isbits, so construction and stepping allocate nothing
+# and never escape to the heap — fuse it straight into a correlation loop. One engine/state
+# pair serves any interleave factor: `carrier_advance(eng, st, K)` steps a stream by K
+# W-wide chunks, so a K-way interleaved loop holds K states and advances each by K.
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    CarrierEngine
+
+Immutable, loop-invariant NCO carrier engine built once by [`carrier_engine`](@ref): holds
+the register-resident sin/cos table and the phase-accumulator frequency word. Pair it with
+one [`CarrierState`](@ref) per interleaved stream and drive it with [`carrier_lookup`](@ref)
+/ [`carrier_advance`](@ref). It is isbits, so it costs no allocation.
+"""
+struct CarrierEngine{T,N,W,Prep}
     prepared::Prep
-    acc_init::Vec{W,UInt32}
-    step_advance::UInt32          # W * freq_word (advance per yielded chunk)
-    num_chunks::Int
+    freq_word::UInt32
 end
 
 """
-    CarrierIterator(table, freq_word::Integer,      num_samples; phase=0, backend=…)
-    CarrierIterator(table, cycles_per_sample::Real, num_samples; phase=0, backend=…)
-    CarrierIterator(table, num_samples; frequency, sampling_frequency, phase=0, backend=…)
+    CarrierState{W}
 
-Iterator over `num_samples ÷ W` chunks (W = SIMD width for the backend/type), each
-yielding `(sin, cos)::Tuple{Vec{W,T},Vec{W,T}}`. The carrier is produced by a textbook
-NCO (UInt32 phase accumulator advanced by `freq_word` per sample) held in the iteration
-state — no carrier array is allocated, the phase is uniform/dead-zone-free and never
-drifts. The low-level form takes a raw `freq_word` (UInt32, `0 ≤ freq_word ≤ 2^32-1`);
-`cycles_per_sample::Real` converts as `round(cps·2^32)`; the keyword form derives it
-from `frequency`/`sampling_frequency`. `phase` is the initial carrier phase (default 0):
-an `Integer` is table steps, a `Real` is cycles. Any leftover `num_samples % W` tail is
-not produced (handle it yourself if needed).
+Immutable, isbits NCO phase-accumulator state (a `Vec{W,UInt32}`). Created by
+[`carrier_state`](@ref) and renewed by value each iteration via [`carrier_advance`](@ref);
+read with [`carrier_lookup`](@ref). Holds no table data, so it stays in registers.
 """
-function CarrierIterator(table::SinCosTable{T,N}, freq_word::Integer,
-                          num_samples::Integer; phase::Real = 0,
-                          backend::Backend = default_backend(T, N)) where {T,N}
+struct CarrierState{W}
+    acc::Vec{W,UInt32}
+end
+
+"""
+    carrier_engine(table, freq_word::Integer;      backend=…) -> CarrierEngine
+    carrier_engine(table, cycles_per_sample::Real; backend=…) -> CarrierEngine
+    carrier_engine(table; frequency, sampling_frequency, backend=…) -> CarrierEngine
+
+Build the loop-invariant carrier engine for `table`. The NCO phase advances by a `UInt32`
+frequency word per sample; the low-level form takes it raw (`0 ≤ freq_word ≤ 2^32-1`),
+`cycles_per_sample::Real` converts as `round(cps·2^32)`, and the keyword form derives it from
+`frequency`/`sampling_frequency`. The phase is uniform, dead-zone-free and never drifts.
+"""
+function carrier_engine(table::SinCosTable{T,N}, freq_word::Integer;
+                        backend::Backend = default_backend(T, N)) where {T,N}
     (0 ≤ freq_word ≤ typemax(UInt32)) ||
         throw(ArgumentError("need 0 ≤ freq_word ≤ typemax(UInt32) = $(typemax(UInt32))"))
-    _make_carrier(table, UInt32(freq_word), Int(num_samples),
-                  _phase_steps(phase, N), backend, _vwidth(backend, T))
+    _make_engine(table, UInt32(freq_word), backend, _vwidth(backend, T))
 end
-function CarrierIterator(table::SinCosTable{T,N}, cycles_per_sample::Real, num_samples::Integer; kw...) where {T,N}
-    CarrierIterator(table, _freq_word(cycles_per_sample), num_samples; kw...)
-end
-function CarrierIterator(table::SinCosTable{T,N}, num_samples::Integer;
-                          frequency::Real, sampling_frequency::Real, kw...) where {T,N}
-    CarrierIterator(table, cycles_per_sample(frequency, sampling_frequency), num_samples; kw...)
-end
+carrier_engine(table::SinCosTable, cps::Real; kw...) = carrier_engine(table, _freq_word(cps); kw...)
+carrier_engine(table::SinCosTable; frequency::Real, sampling_frequency::Real, kw...) =
+    carrier_engine(table, cycles_per_sample(frequency, sampling_frequency); kw...)
 
-function _make_carrier(table::SinCosTable{T,N}, freq_word::UInt32, num_samples, phase_offset,
-                       backend, ::Val{W}) where {T,N,W}
-    acc_offset = _acc_offset(phase_offset, Val(N))
-    acc_init = _init_acc(Val(W), freq_word, acc_offset, 0)
+function _make_engine(table::SinCosTable{T,N}, freq_word::UInt32, backend, ::Val{W}) where {T,N,W}
     prepared = Prepared{T,N}(_prepare(backend, table), backend, T(N - 1))
-    CarrierIterator{T,N,W,typeof(prepared)}(prepared, acc_init, freq_word * UInt32(W), num_samples ÷ W)
-end
-
-Base.length(it::CarrierIterator) = it.num_chunks
-Base.IteratorSize(::Type{<:CarrierIterator}) = Base.HasLength()
-Base.eltype(::Type{<:CarrierIterator{T,N,W}}) where {T,N,W} = Tuple{Vec{W,T},Vec{W,T}}
-
-@inline function Base.iterate(it::CarrierIterator{T,N,W},
-                              state = (it.acc_init, 0)) where {T,N,W}
-    acc, chunk = state
-    chunk >= it.num_chunks && return nothing
-    idx = convert(Vec{W,T}, acc >> _index_shift(Val(N)))
-    result = it.prepared(idx)                         # (sin, cos), mask applied inside
-    (result, (acc + it.step_advance, chunk + 1))
-end
-
-# ---- 4-way interleaved iterator: yields 4 (sin,cos) pairs (4W samples) per step ----
-# The four DDA carry chains are independent, so they overlap even when the consumer is
-# trivial (e.g. array fill) — reaching the ~40 ps/elem loop rate at scale. Use the
-# single-Vec `CarrierIterator` when fusing into nontrivial work (it provides its own ILP).
-struct CarrierIterator4{T,N,W,Prep}
-    prepared::Prep
-    acc1::Vec{W,UInt32}; acc2::Vec{W,UInt32}; acc3::Vec{W,UInt32}; acc4::Vec{W,UInt32}
-    step_advance::UInt32          # 4W * freq_word (advance per yielded step)
-    num_steps::Int
+    CarrierEngine{T,N,W,typeof(prepared)}(prepared, freq_word)
 end
 
 """
-    CarrierIterator4(table, freq_word::Integer,      num_samples; phase=0, backend=…)
-    CarrierIterator4(table, cycles_per_sample::Real, num_samples; phase=0, backend=…)
-    CarrierIterator4(table, num_samples; frequency, sampling_frequency, phase=0, backend=…)
+    carrier_state(eng::CarrierEngine, start::Integer = 0; phase = 0) -> CarrierState
 
-Like [`CarrierIterator`](@ref) but yields a 4-tuple of `(sin, cos)` `Vec` pairs per
-step (`4W` samples), running four interleaved NCO accumulators so the stores/lookups
-overlap. Reaches the full loop throughput (~40 ps/elem) even for trivial consumers such
-as array fill. **Destructure the 4-tuple in the loop header** —
-`for ((s0,c0),(s1,c1),(s2,c2),(s3,c3)) in CarrierIterator4(...)` — rather than
-iterating it with an inner `for pair in quad` loop, which does not unroll and is much
-slower. `phase` is the initial carrier phase (default 0): `Integer` = table steps,
-`Real` = cycles. Produces `num_samples ÷ (4W)` steps; handle any tail yourself.
+Initial NCO state for a stream whose first sample is absolute index `start` (use `(k-1)·W`
+for the k-th lane of a W-wide, K-way interleaved loop). `phase` is the initial carrier phase
+added to every lane: an `Integer` is table steps, a `Real` is cycles.
 """
-function CarrierIterator4(table::SinCosTable{T,N}, freq_word::Integer,
-                           num_samples::Integer; phase::Real = 0,
-                           backend::Backend = default_backend(T, N)) where {T,N}
-    (0 ≤ freq_word ≤ typemax(UInt32)) ||
-        throw(ArgumentError("need 0 ≤ freq_word ≤ typemax(UInt32) = $(typemax(UInt32))"))
-    _make_carrier4(table, UInt32(freq_word), Int(num_samples),
-                   _phase_steps(phase, N), backend, _vwidth(backend, T))
-end
-function CarrierIterator4(table::SinCosTable{T,N}, cycles_per_sample::Real, num_samples::Integer; kw...) where {T,N}
-    CarrierIterator4(table, _freq_word(cycles_per_sample), num_samples; kw...)
-end
-function CarrierIterator4(table::SinCosTable{T,N}, num_samples::Integer;
-                           frequency::Real, sampling_frequency::Real, kw...) where {T,N}
-    CarrierIterator4(table, cycles_per_sample(frequency, sampling_frequency), num_samples; kw...)
+@inline function carrier_state(eng::CarrierEngine{T,N,W}, start::Integer = 0;
+                               phase::Real = 0) where {T,N,W}
+    acc_offset = _acc_offset(_phase_steps(phase, N), Val(N))
+    CarrierState{W}(_init_acc(Val(W), eng.freq_word, acc_offset, Int(start)))
 end
 
-function _make_carrier4(table::SinCosTable{T,N}, freq_word::UInt32, num_samples, phase_offset,
-                        backend, ::Val{W}) where {T,N,W}
-    acc_offset = _acc_offset(phase_offset, Val(N))
-    acc1 = _init_acc(Val(W), freq_word, acc_offset, 0)
-    acc2 = _init_acc(Val(W), freq_word, acc_offset, W)
-    acc3 = _init_acc(Val(W), freq_word, acc_offset, 2W)
-    acc4 = _init_acc(Val(W), freq_word, acc_offset, 3W)
-    prepared = Prepared{T,N}(_prepare(backend, table), backend, T(N - 1))
-    CarrierIterator4{T,N,W,typeof(prepared)}(prepared, acc1, acc2, acc3, acc4,
-        freq_word * UInt32(4W), num_samples ÷ (4W))
-end
+"""
+    carrier_lookup(eng::CarrierEngine, st::CarrierState) -> (sin::Vec{W,T}, cos::Vec{W,T})
 
-Base.length(it::CarrierIterator4) = it.num_steps
-Base.IteratorSize(::Type{<:CarrierIterator4}) = Base.HasLength()
-Base.eltype(::Type{<:CarrierIterator4{T,N,W}}) where {T,N,W} = NTuple{4,Tuple{Vec{W,T},Vec{W,T}}}
+The `(sin, cos)` chunk at `st`'s current phase. Pure read — does not advance the state.
+"""
+@inline carrier_lookup(eng::CarrierEngine{T,N,W}, st::CarrierState{W}) where {T,N,W} =
+    eng.prepared(convert(Vec{W,T}, st.acc >> _index_shift(Val(N))))
 
-@inline function Base.iterate(it::CarrierIterator4{T,N,W},
-                              state = (it.acc1, it.acc2, it.acc3, it.acc4, 0)) where {T,N,W}
-    acc1, acc2, acc3, acc4, step_count = state
-    step_count >= it.num_steps && return nothing
-    shift = _index_shift(Val(N))
-    pair1 = it.prepared(convert(Vec{W,T}, acc1 >> shift)); pair2 = it.prepared(convert(Vec{W,T}, acc2 >> shift))
-    pair3 = it.prepared(convert(Vec{W,T}, acc3 >> shift)); pair4 = it.prepared(convert(Vec{W,T}, acc4 >> shift))
-    step_advance = it.step_advance
-    ((pair1, pair2, pair3, pair4),
-     (acc1 + step_advance, acc2 + step_advance, acc3 + step_advance, acc4 + step_advance, step_count + 1))
-end
+"""
+    carrier_advance(eng::CarrierEngine, st::CarrierState, nchunks::Integer) -> CarrierState
+
+Advance the stream by `nchunks` W-wide chunks (`nchunks·W` samples), returning a new
+immutable state. A K-way interleaved loop advances every state by `K` each iteration.
+"""
+@inline carrier_advance(eng::CarrierEngine{T,N,W}, st::CarrierState{W}, nchunks::Integer) where {T,N,W} =
+    CarrierState{W}(st.acc + eng.freq_word * UInt32(Int(nchunks) * W))
+
+"""
+    carrier_width(eng::CarrierEngine) -> Int
+
+SIMD lane count `W` of the engine (samples per chunk).
+"""
+@inline carrier_width(::CarrierEngine{T,N,W}) where {T,N,W} = W

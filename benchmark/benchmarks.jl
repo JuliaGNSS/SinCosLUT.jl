@@ -3,13 +3,12 @@
 
 using BenchmarkTools, SinCosLUT, SIMD
 
-# Iterator constructors were renamed generate_carrier(4) → CarrierIterator(4) in v2. Use the
-# pre-v2 function name when it still exists (the base rev), else the v2 constructor — so this
-# one script runs against both revs in the AirspeedVelocity comparison. (Discriminate on the
-# old *function* name: the CarrierIterator *struct* already exists on v1.1.0 too, only the
-# constructor moved, so checking for the struct would wrongly pick it on the base.)
-const _CARRIER  = isdefined(SinCosLUT, :generate_carrier)  ? SinCosLUT.generate_carrier  : SinCosLUT.CarrierIterator
-const _CARRIER4 = isdefined(SinCosLUT, :generate_carrier4) ? SinCosLUT.generate_carrier4 : SinCosLUT.CarrierIterator4
+# The fused carrier path was rewritten from the `CarrierIterator`/`CarrierIterator4` iterators
+# (≤ v2) to the value-based `carrier_engine`/`carrier_state`/… API (v3, breaking). benchpkg runs
+# THIS (head) script against both the PR head and its base build, so the fused benchmarks below
+# pick the API available on each rev — keyed identically so the comparison measures the rewrite's
+# effect directly. Discriminate on the new `carrier_engine` function (absent on every pre-v3 rev).
+const _HAS_ENGINE = isdefined(SinCosLUT, :carrier_engine)
 
 const SUITE = BenchmarkGroup()
 # Three buffer sizes probe three regimes:
@@ -28,15 +27,32 @@ for (label, n) in SIZES, (T, steps) in ((Int8, 64), (Int16, 64), (Int32, 32))
     SUITE["carrier!"]["$T/$label"] = @benchmarkable generate_carrier!($s, $c, $tbl, $FREQ_WORD)
 end
 
-# ---- 4-wide interleaved iterator filling arrays (Int8) — the ~40 ps/elem path ----
-# Width is the backend's SIMD width (64 on AVX-512, 32 on AVX2, …), so read it off the
-# yielded Vec rather than hard-coding it — keeps the suite runnable on AVX2-only hosts.
-function _fill4!(sins, coss, tbl)
-    i = 1
-    @inbounds for q in _CARRIER4(tbl, FREQ_WORD, length(sins))
-        for (sv, cv) in q
-            W = length(sv)
-            sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
+# ---- 4-way interleaved fill (Int8) — the ~40 ps/elem path ----
+# Width W is the backend's SIMD width (64 on AVX-512, 32 on AVX2, …). v3 reads it off the engine;
+# the pre-v3 fallback reads it off the yielded Vec — keeps the suite runnable on AVX2-only hosts.
+@static if _HAS_ENGINE
+    function _fill4!(sins, coss, tbl)
+        eng = carrier_engine(tbl, FREQ_WORD); W = carrier_width(eng)
+        st1 = carrier_state(eng, 0); st2 = carrier_state(eng, W)
+        st3 = carrier_state(eng, 2W); st4 = carrier_state(eng, 3W)
+        @inbounds for step in 0:(length(sins) ÷ (4W) - 1)
+            base = step * 4W + 1
+            v1 = carrier_lookup(eng, st1); sins[VecRange{W}(base)]      = v1[1]; coss[VecRange{W}(base)]      = v1[2]
+            v2 = carrier_lookup(eng, st2); sins[VecRange{W}(base + W)]  = v2[1]; coss[VecRange{W}(base + W)]  = v2[2]
+            v3 = carrier_lookup(eng, st3); sins[VecRange{W}(base + 2W)] = v3[1]; coss[VecRange{W}(base + 2W)] = v3[2]
+            v4 = carrier_lookup(eng, st4); sins[VecRange{W}(base + 3W)] = v4[1]; coss[VecRange{W}(base + 3W)] = v4[2]
+            st1 = carrier_advance(eng, st1, 4); st2 = carrier_advance(eng, st2, 4)
+            st3 = carrier_advance(eng, st3, 4); st4 = carrier_advance(eng, st4, 4)
+        end
+    end
+else
+    function _fill4!(sins, coss, tbl)   # pre-v3: the CarrierIterator4 iterator
+        i = 1
+        @inbounds for q in SinCosLUT.CarrierIterator4(tbl, FREQ_WORD, length(sins))
+            for (sv, cv) in q
+                W = length(sv)
+                sins[VecRange{W}(i)] = sv; coss[VecRange{W}(i)] = cv; i += W
+            end
         end
     end
 end
@@ -47,13 +63,26 @@ for (label, n) in SIZES
     end
 end
 
-# ---- fused, array-free reduction over the single-Vec iterator (Int8) ----
-function _reduce(tbl, n)
-    acc = 0
-    @inbounds for (sv, _) in _CARRIER(tbl, FREQ_WORD, n)
-        acc += sum(Vec{length(sv),Int32}(sv))
+# ---- fused, array-free reduction over a single stream (Int8) ----
+@static if _HAS_ENGINE
+    function _reduce(tbl, n)
+        eng = carrier_engine(tbl, FREQ_WORD); W = carrier_width(eng); st = carrier_state(eng)
+        acc = 0
+        @inbounds for _ in 1:(n ÷ W)
+            sv, _ = carrier_lookup(eng, st)
+            acc += sum(convert(Vec{W,Int32}, sv))
+            st = carrier_advance(eng, st, 1)
+        end
+        acc
     end
-    acc
+else
+    function _reduce(tbl, n)            # pre-v3: the single-Vec CarrierIterator iterator
+        acc = 0
+        @inbounds for (sv, _) in SinCosLUT.CarrierIterator(tbl, FREQ_WORD, n)
+            acc += sum(Vec{length(sv),Int32}(sv))
+        end
+        acc
+    end
 end
 SUITE["fused_reduce_Int8"] = BenchmarkGroup()
 for (label, n) in SIZES

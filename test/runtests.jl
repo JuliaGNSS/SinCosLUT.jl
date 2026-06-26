@@ -23,8 +23,14 @@ end
 # NCO frequency word used across the byte-exact tests (≈0.005 cycles/sample).
 const FW = 0x0a3d70a3
 
-# Fused reduction over the iterator (width/type-agnostic via sum(s)).
-reduce_carrier(t, b, n) = (a = 0; for (s, _) in CarrierIterator(t, FW, n; backend = b); a += sum(s); end; a)
+# Fused reduction over the value-based engine (width/type-agnostic via sum(s)).
+function reduce_carrier(t, b, n)
+    eng = carrier_engine(t, FW; backend = b); st = carrier_state(eng); a = 0
+    for _ in 1:(n ÷ carrier_width(eng))
+        s, _ = carrier_lookup(eng, st); a += sum(s); st = carrier_advance(eng, st, 1)
+    end
+    a
+end
 # Measure allocations INSIDE a barrier so `b` is concrete at the @allocated site.
 # (A default-backend value is abstractly typed; on some Julia versions that boxes per
 # element when measured directly. Specialising here gives a true 0.)
@@ -127,29 +133,37 @@ end
         @test maxerr < 0.11          # 64 phase steps, floored: error ≲ one step ≈ π/64 ≈ 0.098
     end
 
-    @testset "iterator == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
+    @testset "engine (1-wide) == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
         sref, cref = ref_carrier(T, N, FW, L)
-        W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
+        eng = carrier_engine(tbl, FW); W = carrier_width(eng)
         nfull = (L ÷ W) * W
-        s = zeros(T, L); c = zeros(T, L); i = 1
-        for (sv, cv) in CarrierIterator(tbl, FW, L)
+        s = zeros(T, L); c = zeros(T, L); st = carrier_state(eng); i = 1
+        for _ in 1:(L ÷ W)
+            sv, cv = carrier_lookup(eng, st)
             s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
+            st = carrier_advance(eng, st, 1)
         end
         @test s[1:nfull] == sref[1:nfull]
         @test c[1:nfull] == cref[1:nfull]
     end
 
-    @testset "carrier4 == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
+    @testset "engine (4-way interleaved) == carrier! ($T, N=$N)" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
         sref, cref = ref_carrier(T, N, FW, L)
-        W = SinCosLUT._val(SinCosLUT._vwidth(default_backend(T, N), T))
+        eng = carrier_engine(tbl, FW); W = carrier_width(eng)
         nfull = (L ÷ (4W)) * (4W)
-        s = zeros(T, L); c = zeros(T, L); i = 1
-        for quad in CarrierIterator4(tbl, FW, L)
-            for (sv, cv) in quad
-                s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
-            end
+        s = zeros(T, L); c = zeros(T, L)
+        st1 = carrier_state(eng, 0); st2 = carrier_state(eng, W)
+        st3 = carrier_state(eng, 2W); st4 = carrier_state(eng, 3W)
+        for step in 0:(L ÷ (4W) - 1)
+            base = step * 4W + 1
+            v1 = carrier_lookup(eng, st1); s[SIMD.VecRange{W}(base)]      = v1[1]; c[SIMD.VecRange{W}(base)]      = v1[2]
+            v2 = carrier_lookup(eng, st2); s[SIMD.VecRange{W}(base + W)]  = v2[1]; c[SIMD.VecRange{W}(base + W)]  = v2[2]
+            v3 = carrier_lookup(eng, st3); s[SIMD.VecRange{W}(base + 2W)] = v3[1]; c[SIMD.VecRange{W}(base + 2W)] = v3[2]
+            v4 = carrier_lookup(eng, st4); s[SIMD.VecRange{W}(base + 3W)] = v4[1]; c[SIMD.VecRange{W}(base + 3W)] = v4[2]
+            st1 = carrier_advance(eng, st1, 4); st2 = carrier_advance(eng, st2, 4)
+            st3 = carrier_advance(eng, st3, 4); st4 = carrier_advance(eng, st4, 4)
         end
         @test s[1:nfull] == sref[1:nfull]
         @test c[1:nfull] == cref[1:nfull]
