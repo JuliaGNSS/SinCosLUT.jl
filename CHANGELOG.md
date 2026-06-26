@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.0.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.0.0...v3.0.1) (2026-06-26)
+
+
+### Performance Improvements
+
+* **avx512:** byte-gather the carrier NCO index (7→3 shuffle-port µops) ([df07e68](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/df07e68d543427fb7256396ce897ce2609d9eff9))
+* **neon:** byte-gather the carrier NCO index via tbl4 ([e76826e](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/e76826e965a5a8b3f5bce4973bb35d8e158ae34a))
+
 # [3.0.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v2.0.0...v3.0.0) (2026-06-26)
 
 
