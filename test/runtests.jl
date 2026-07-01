@@ -285,10 +285,13 @@ end
             generate_carrier_signs!(sp, cp, n, cycles_per_sample(f, fs); phase = 0.25)
             @test sp == c1
         end
-        # allocation-free fill and argument validation
+        # allocation-free fill and argument validation. Measure through a barrier that discards the
+        # return: the fill is 0-alloc, but the returned `(sin, cos)` tuple is only elided by the
+        # optimizer on Julia ≥ 1.11, so measuring the call directly counts it on 1.10.
+        _alloc_probe(s, c, n, fw) = (generate_carrier_signs!(s, c, n, fw); nothing)
         let n = 4096, s = Vector{UInt64}(undef, 64), c = Vector{UInt64}(undef, 64)
-            generate_carrier_signs!(s, c, n, 0x0a3d70a3)          # compile
-            @test (@allocated generate_carrier_signs!(s, c, n, 0x0a3d70a3)) == 0
+            _alloc_probe(s, c, n, 0x0a3d70a3)                     # compile
+            @test (@allocated _alloc_probe(s, c, n, 0x0a3d70a3)) == 0
             @test_throws DimensionMismatch generate_carrier_signs!(zeros(UInt64,1), c, n, 0x1)
             @test_throws ArgumentError generate_carrier_signs!(s, c, n, typemax(UInt32) + 1)
         end
