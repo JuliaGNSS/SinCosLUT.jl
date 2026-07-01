@@ -20,8 +20,8 @@ module SinCosLUT
 
 using SIMD
 
-export SinCosTable, generate_carrier!, lookup_sincos!, prepare, cycles_per_sample,
-       default_backend, backend_name,
+export SinCosTable, generate_carrier!, generate_carrier_signs!, lookup_sincos!, prepare,
+       cycles_per_sample, default_backend, backend_name,
        CarrierEngine, CarrierState, carrier_engine, carrier_state, carrier_lookup,
        carrier_advance, carrier_width
 
@@ -78,6 +78,7 @@ end
 end
 include("kernel.jl")
 include("iterate.jl")
+include("signbits.jl")
 
 # ---- backend selection ----
 @static if Sys.ARCH in (:x86_64, :i686)
