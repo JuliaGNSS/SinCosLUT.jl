@@ -20,6 +20,9 @@
 #     word no matter how many flips it contains — no per-sample loop.
 
 @inline _msb(x::UInt32) = (x & 0x80000000) != zero(UInt32)
+# Low-`rem`-bits mask (all ones for a full 64-lane word). Top-level, not a local closure —
+# a local closure here boxes on Julia 1.10 (≈32 B/call).
+@inline _lowmask(rem::Int) = rem == 64 ? typemax(UInt64) : (UInt64(1) << rem) - UInt64(1)
 
 # Lane ramp [0,1,…,63] as a compile-time-constant Vec (folded to a literal).
 @inline @generated _iota_u32() = :(Vec{64,UInt32}($(Expr(:tuple, (UInt32(j) for j in 0:63)...))))
@@ -121,19 +124,18 @@ function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractV
     # ≤ 1 sign flip per word ⇔ the word advances < ½ cycle ⇔ 64·fw < 2³¹ ⇔ fw < 2²⁵. Test fw
     # directly (NOT the wrapped `step`, which loses the whole-cycle count for a fast carrier).
     single_flip = fw < 0x02000000
-    mask(rem) = rem == 64 ? typemax(UInt64) : (UInt64(1) << rem) - UInt64(1)
     base = off                                 # accumulator at sample 0 (lane 0) = off
     @inbounds for w in 1:nwords
-        rem = w == nwords ? n - (w - 1) * 64 : 64                       # valid lanes (tail may be < 64)
+        m = _lowmask(w == nwords ? n - (w - 1) * 64 : 64)              # valid-lane mask (tail may be < 64)
         bc = base + 0x40000000                                          # cos accumulator (+¼ cycle)
         sin_const = single_flip && _msb(base) == _msb(base + span)
         cos_const = single_flip && _msb(bc)   == _msb(bc + span)
         if sin_const & cos_const                                        # both constant → two stores
-            sin_signs[w] = (_msb(base) ? typemax(UInt64) : zero(UInt64)) & mask(rem)
-            cos_signs[w] = (_msb(bc)   ? typemax(UInt64) : zero(UInt64)) & mask(rem)
+            sin_signs[w] = (_msb(base) ? typemax(UInt64) : zero(UInt64)) & m
+            cos_signs[w] = (_msb(bc)   ? typemax(UInt64) : zero(UInt64)) & m
         else                                                            # a flip inside → one lookup
             sw, cw = _flip_words(base, ramp)
-            sin_signs[w] = sw & mask(rem); cos_signs[w] = cw & mask(rem)
+            sin_signs[w] = sw & m; cos_signs[w] = cw & m
         end
         base += step
     end
