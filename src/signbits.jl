@@ -10,42 +10,59 @@
 #   cos(2π·φ) < 0  ⇔  φ mod 1 ∈ (¼, ¾)      ⇔  MSB(acc + ¼ cycle)    is set
 #
 # The signs are packed into `UInt64` words (bit `j` of word `w` ↔ sample `64w+j`), a set
-# bit meaning that component is NEGATIVE (the ±1 hard-limited value is −1). Because a 1-bit
-# carrier is a square wave, the sign is constant for `sampling_frequency/(2·frequency)`
-# samples at a time: for a typical low residual carrier that is thousands of samples, so
-# almost every 64-sample word is a single constant run written with ONE store. Only a word
-# that straddles a sign flip is filled bit-by-bit. Work is therefore O(#flips)+O(#words)
-# rather than O(#samples) with a per-sample table lookup and a sign extraction.
+# bit meaning that component is NEGATIVE (the ±1 hard-limited value is −1).
+#
+# Fast at ANY frequency via two per-word paths:
+#   • constant run — when the whole 64-sample word has one sign (a low residual carrier is a
+#     square wave with runs of thousands of samples), write it in ONE store;
+#   • otherwise — a sign flip falls inside the word: extract the top bit of all 64 phase
+#     accumulators at once with a single SIMD sign-mask (`vpmovd2m` / equivalent), O(1) per
+#     word no matter how many flips it contains — no per-sample loop.
 
 @inline _msb(x::UInt32) = (x & 0x80000000) != zero(UInt32)
 
-# Sign bits of one 64-sample word. `b` is the accumulator at the word's first sample; the
-# lanes are `b, b+fw, …, b+63·fw`. `rem` (≤64) is how many lanes are valid (the last word of
-# a run may be short — the high bits stay 0). `single_flip` asserts the word spans < ½ cycle,
-# so at most one sign flip occurs and equal endpoints ⇒ a constant run.
-@inline function _sign_word(b::UInt32, fw::UInt32, span::UInt32, rem::Int, single_flip::Bool)
-    if single_flip && rem == 64 && _msb(b) == _msb(b + span)
-        return _msb(b) ? typemax(UInt64) : zero(UInt64)          # constant run — one store
+# Lane ramp [0,1,…,63] as a compile-time-constant Vec (folded to a literal).
+@inline @generated _iota_u32() = :(Vec{64,UInt32}($(Expr(:tuple, (UInt32(j) for j in 0:63)...))))
+
+# Pack the sign bit (MSB) of 64 `UInt32` lanes into a `UInt64`: bit j set ⇔ lane j has its top
+# bit set (interpreted as a signed `Int32`, that lane is negative). Portable LLVM (an `icmp` +
+# `<64 x i1>→i64` bitcast); lowers to `vpmovd2m`+kmov on AVX-512, a compare/movemask sequence on
+# AVX2/NEON, and scalar elsewhere — always correct.
+@inline _msb_pack(v::Vec{64,UInt32}) = Base.llvmcall(("""
+    define i64 @entry(<64 x i32> %v) #0 {
+      %c = icmp slt <64 x i32> %v, zeroinitializer
+      %m = bitcast <64 x i1> %c to i64
+      ret i64 %m }
+    attributes #0 = { alwaysinline }""", "entry"),
+    UInt64, Tuple{NTuple{64,Base.VecElement{Int32}}}, reinterpret(Vec{64,Int32}, v).data)
+
+# Sign bits of one 64-sample word. `b` is the accumulator at the word's first sample; lane j has
+# accumulator `b + ramp[j]` (`ramp[j] = j·freq_word`). `span = 63·freq_word`. `single_flip` asserts
+# the word advances < ½ cycle (so ≤ 1 sign flip): then equal endpoints ⇒ a constant run written in
+# one store; anything else is packed with the SIMD sign-mask. Only the low `rem` (≤64) bits are kept.
+@inline function _sign_word(b::UInt32, ramp::Vec{64,UInt32}, span::UInt32, rem::Int, single_flip::Bool)
+    word = if single_flip && _msb(b) == _msb(b + span)
+        _msb(b) ? typemax(UInt64) : zero(UInt64)            # constant run — one store
+    else
+        _msb_pack(Vec{64,UInt32}(b) + ramp)                 # ≥1 flip inside — one SIMD sign-mask
     end
-    word = zero(UInt64); a = b                                    # straddles a flip / short tail
-    @inbounds for j in 0:(rem - 1)
-        _msb(a) && (word |= UInt64(1) << j)
-        a += fw
-    end
-    word
+    rem == 64 ? word : word & ((UInt64(1) << rem) - UInt64(1))
 end
 
 function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractVector{UInt64},
                          n::Int, fw::UInt32, off::UInt32)
     nwords = cld(n, 64)
-    step = fw * UInt32(64)                 # accumulator advance per 64-sample word
-    span = fw * UInt32(63)                 # advance across the 63 lanes within a word
-    single_flip = step < 0x80000000        # < ½ cycle per word ⇒ ≤ 1 flip ⇒ run-fill is valid
-    base = off                             # accumulator at sample 0 (lane 0) = off
+    ramp = _iota_u32() * Vec{64,UInt32}(fw)    # lane j = j·freq_word (accumulator offsets within a word)
+    step = fw * UInt32(64)                     # accumulator advance per 64-sample word (wraps mod 2³²)
+    span = fw * UInt32(63)                     # advance across the 63 lanes within a word
+    # ≤ 1 sign flip per word ⇔ the word advances < ½ cycle ⇔ 64·fw < 2³¹ ⇔ fw < 2²⁵. Test fw
+    # directly (NOT the wrapped `step`, which loses the whole-cycle count for a fast carrier).
+    single_flip = fw < 0x02000000
+    base = off                                 # accumulator at sample 0 (lane 0) = off
     @inbounds for w in 1:nwords
-        rem = w == nwords ? n - (w - 1) * 64 : 64                 # valid lanes (tail may be < 64)
-        sin_signs[w] = _sign_word(base, fw, span, rem, single_flip)
-        cos_signs[w] = _sign_word(base + 0x40000000, fw, span, rem, single_flip)  # +¼ cycle
+        rem = w == nwords ? n - (w - 1) * 64 : 64                       # valid lanes (tail may be < 64)
+        sin_signs[w] = _sign_word(base, ramp, span, rem, single_flip)
+        cos_signs[w] = _sign_word(base + 0x40000000, ramp, span, rem, single_flip)  # +¼ cycle
         base += step
     end
     sin_signs, cos_signs
@@ -69,10 +86,11 @@ frequency argument matches `generate_carrier!`: a raw `UInt32` `freq_word`, a
 `cycles_per_sample::Real` (`freq_word = round(cps·2³²)`), or the `frequency`/`sampling_frequency`
 keyword form. `phase` is the initial carrier phase in **cycles** (a `Real`; default 0).
 
-A 1-bit carrier is a square wave, so the sign is constant for `≈ sampling_frequency /
-(2·frequency)` samples; almost every 64-sample word is a single constant run filled with one
-store, and only words straddling a sign flip are filled bit-by-bit. This is the carrier form a
-bit-wise correlator consumes, where wipe-off becomes XOR and accumulation becomes popcount.
+Fast at any frequency: a 1-bit carrier is a square wave, so for a low residual carrier almost
+every 64-sample word is a single constant run written with one store; where a sign flip falls
+inside a word, the 64 signs are packed with a single SIMD sign-mask (no per-sample loop). This
+is the carrier form a bit-wise correlator consumes, where wipe-off becomes XOR and accumulation
+becomes popcount.
 
 ```julia
 n = 5000

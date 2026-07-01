@@ -28,12 +28,12 @@ for (label, n) in SIZES, (T, steps) in ((Int8, 64), (Int16, 64), (Int32, 32))
 end
 
 # ---- 1-bit (hard-limited) carrier: pack sign bits straight off the NCO into UInt64 words ----
-# Run at the SAME FREQ_WORD as the rows above. Unlike the LUT rows (frequency-independent), this
-# cost is frequency-DEPENDENT: a 1-bit carrier is a square wave filled by runs of constant sign,
-# fastest for a LOW residual carrier (long runs → whole 64-sample words in one store) and degrading
-# toward a per-bit fill as the frequency rises and a sign flip falls inside every word — which is
-# the regime FREQ_WORD (≈0.04 cycles/sample) sits in. New in this PR; guard on the function so
-# benchpkg still runs against a base rev without it.
+# Run at the SAME FREQ_WORD as the rows above. Cost is only mildly frequency-dependent: a low
+# residual carrier is a square wave whose 64-sample words are mostly single constant runs (one
+# store); where a sign flip falls inside a word the 64 signs are packed with one SIMD sign-mask.
+# Both paths are O(1) per word, so it stays fast at any frequency (FREQ_WORD ≈0.04 cycles/sample
+# exercises the SIMD-sign-mask path). New in this PR; guard on the function so benchpkg still runs
+# against a base rev without it.
 @static if isdefined(SinCosLUT, :generate_carrier_signs!)
     SUITE["carrier_signs!"] = BenchmarkGroup()
     for (label, n) in SIZES
