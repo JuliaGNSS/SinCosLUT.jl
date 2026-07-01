@@ -27,6 +27,22 @@ for (label, n) in SIZES, (T, steps) in ((Int8, 64), (Int16, 64), (Int32, 32))
     SUITE["carrier!"]["$T/$label"] = @benchmarkable generate_carrier!($s, $c, $tbl, $FREQ_WORD)
 end
 
+# ---- 1-bit (hard-limited) carrier: pack sign bits straight off the NCO into UInt64 words ----
+# Run at the SAME FREQ_WORD as the rows above. Unlike the LUT rows (frequency-independent), this
+# cost is frequency-DEPENDENT: a 1-bit carrier is a square wave filled by runs of constant sign,
+# fastest for a LOW residual carrier (long runs → whole 64-sample words in one store) and degrading
+# toward a per-bit fill as the frequency rises and a sign flip falls inside every word — which is
+# the regime FREQ_WORD (≈0.04 cycles/sample) sits in. New in this PR; guard on the function so
+# benchpkg still runs against a base rev without it.
+@static if isdefined(SinCosLUT, :generate_carrier_signs!)
+    SUITE["carrier_signs!"] = BenchmarkGroup()
+    for (label, n) in SIZES
+        ss = Vector{UInt64}(undef, cld(n, 64)); cs = Vector{UInt64}(undef, cld(n, 64))
+        SUITE["carrier_signs!"][label] =
+            @benchmarkable generate_carrier_signs!($ss, $cs, $n, $FREQ_WORD)
+    end
+end
+
 # ---- 4-way interleaved fill (Int8) — the ~40 ps/elem path ----
 # Width W is the backend's SIMD width (64 on AVX-512, 32 on AVX2, …). v3 reads it off the engine;
 # the pre-v3 fallback reads it off the yielded Vec — keeps the suite runnable on AVX2-only hosts.

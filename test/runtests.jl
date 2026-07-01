@@ -239,6 +239,57 @@ end
         end
     end
 
+    @testset "one-bit carrier sign bits" begin
+        using SinCosLUT: _freq_word
+        # Ground-truth: bit = MSB of the same UInt32 NCO. acc[n] = fw*n + off (mod 2^32);
+        # sin<0 ⇔ MSB(acc); cos<0 ⇔ MSB(acc + ¼ cycle).
+        function ref_signs(n, fw::UInt32; phase = 0)
+            off = _freq_word(phase)
+            s = zeros(UInt64, cld(n, 64)); c = zeros(UInt64, cld(n, 64))
+            for k in 1:n
+                acc = fw * UInt32(k - 1) + off
+                (acc & 0x80000000 != 0)               && (s[((k-1)>>6)+1] |= UInt64(1) << ((k-1)&63))
+                ((acc+0x40000000) & 0x80000000 != 0)  && (c[((k-1)>>6)+1] |= UInt64(1) << ((k-1)&63))
+            end
+            s, c
+        end
+        # low freq (long runs → run-fill fast path) and high freq (a flip inside most words)
+        @testset "n=$n fw=$(repr(fw))" for n in (5000, 20000, 64, 63, 130),
+                                            fw in (0x0010c6f8, 0x0a3d70a3, 0x2aaaaaab)
+            ns = cld(n, 64)
+            s = Vector{UInt64}(undef, ns); c = Vector{UInt64}(undef, ns)
+            generate_carrier_signs!(s, c, n, fw)
+            rs, rc = ref_signs(n, fw)
+            @test s == rs && c == rc
+        end
+        # bits past sample n in the final word are cleared (tail masking)
+        let n = 130                       # 3 words, last word holds 2 valid bits
+            s = fill(typemax(UInt64), 3); c = fill(typemax(UInt64), 3)
+            generate_carrier_signs!(s, c, n, 0x0a3d70a3)
+            @test (s[3] >> (n & 63)) == 0 && (c[3] >> (n & 63)) == 0
+        end
+        # the three frequency-argument forms agree, and `phase` shifts as expected
+        let n = 5000, fs = 5_000_000, f = 1234
+            s1 = Vector{UInt64}(undef, cld(n,64)); c1 = similar(s1)
+            s2 = similar(s1); c2 = similar(s1); s3 = similar(s1); c3 = similar(s1)
+            generate_carrier_signs!(s1, c1, n, _freq_word(cycles_per_sample(f, fs)))
+            generate_carrier_signs!(s2, c2, n, cycles_per_sample(f, fs))
+            generate_carrier_signs!(s3, c3, n; frequency = f, sampling_frequency = fs)
+            @test s1 == s2 == s3 && c1 == c2 == c3
+            # a ¼-cycle phase shift turns sin signs into cos signs
+            sp = similar(s1); cp = similar(s1)
+            generate_carrier_signs!(sp, cp, n, cycles_per_sample(f, fs); phase = 0.25)
+            @test sp == c1
+        end
+        # allocation-free fill and argument validation
+        let n = 4096, s = Vector{UInt64}(undef, 64), c = Vector{UInt64}(undef, 64)
+            generate_carrier_signs!(s, c, n, 0x0a3d70a3)          # compile
+            @test (@allocated generate_carrier_signs!(s, c, n, 0x0a3d70a3)) == 0
+            @test_throws DimensionMismatch generate_carrier_signs!(zeros(UInt64,1), c, n, 0x1)
+            @test_throws ArgumentError generate_carrier_signs!(s, c, n, typemax(UInt32) + 1)
+        end
+    end
+
     println("default backends: ",
         join(["$T/$N→$(backend_name(default_backend(T,N)))" for (T,Ns) in cases for N in Ns], "  "))
 end

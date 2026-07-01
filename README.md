@@ -77,6 +77,24 @@ phases = rand(Int8, 4096)
 lookup_sincos!(sins, coss, phases, tbl)
 ```
 
+### One-bit (hard-limited) carrier
+
+For bit-wise ("bit-sliced") software correlators the carrier is quantised to a single sign
+bit, so wipe-off becomes XOR and accumulation becomes popcount. `generate_carrier_signs!`
+produces that directly — no table, no output-type quantisation — by reading the sign off the
+same UInt32 NCO (`sign(sin) = MSB(acc)`, `sign(cos) = MSB(acc + ¼ cycle)`) and packing it into
+`UInt64` words (bit `j` of word `w` ↔ sample `64w+j`; a set bit means that component is
+negative). A 1-bit carrier is a square wave, so almost every 64-sample word is a single
+constant run written with one store — only words straddling a sign flip are filled bit-by-bit:
+
+```julia
+n = 5000
+sin_signs = Vector{UInt64}(undef, cld(n, 64))
+cos_signs = Vector{UInt64}(undef, cld(n, 64))
+# same frequency forms as generate_carrier! (raw freq_word / cycles_per_sample / keyword)
+generate_carrier_signs!(sin_signs, cos_signs, n; frequency = 1234, sampling_frequency = 5e6)
+```
+
 ### Array-free / fused generation (returns `Vec`s, like FastSinCos)
 
 To avoid materialising a carrier array (and the cache traffic that comes with it),
