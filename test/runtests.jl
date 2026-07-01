@@ -253,9 +253,13 @@ end
             end
             s, c
         end
-        # low freq (long runs → run-fill fast path) and high freq (a flip inside most words)
+        # low freq (long runs → run-fill fast path) and high freq (a flip inside most words).
+        # 0x4ccccccd (≈0.3 cyc/sample) is the trap case: 64·fw wraps mod 2³² to < 2³¹, so a guard
+        # on the wrapped step would wrongly take the constant-run path — the fill path is only
+        # valid when fw < 2²⁵. 0x02000001 is just past that boundary.
         @testset "n=$n fw=$(repr(fw))" for n in (5000, 20000, 64, 63, 130),
-                                            fw in (0x0010c6f8, 0x0a3d70a3, 0x2aaaaaab)
+                                            fw in (0x0010c6f8, 0x01ffffff, 0x02000001,
+                                                   0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd)
             ns = cld(n, 64)
             s = Vector{UInt64}(undef, ns); c = Vector{UInt64}(undef, ns)
             generate_carrier_signs!(s, c, n, fw)
