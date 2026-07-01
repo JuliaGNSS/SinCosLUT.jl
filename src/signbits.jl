@@ -53,18 +53,64 @@ const _SIGN_TABLE = SinCosTable{Int8,64}(
     ntuple(k -> (16 ≤ (k - 1) < 48) ? Int8(-1) : Int8(1), Val(64)))            # cos<0 ⇔ k∈[16,48)
 const _SIGN_PREP = prepare(_SIGN_TABLE)
 
-# Sign words (sin, cos) of one full 64-sample word that contains ≥ 1 flip. AVX-512 path: one cheap
-# byte-gather index + a permute of the ±1 quadrant table (both columns) + two Int8 sign-masks —
-# ~2× cheaper than masking the 4-register UInt32 accumulator. Other backends: the UInt32 sign-mask.
+# Sign words (sin, cos) of one full 64-sample word that contains ≥ 1 flip. The SIMD backends use
+# the package's own cheap index (byte-gather) + a permute of the ±1 quadrant table (both columns) +
+# an Int8 sign-mask per SIMD chunk — the carrier's own permute machinery, at whatever width the
+# backend runs (AVX-512: one 64-lane chunk; AVX2: 2×32; NEON: 4×16). Portable / any other backend
+# uses the generic UInt32 sign-mask. All bit-identical (they all read the accumulator's top bit).
 @inline _flip_words(base::UInt32, ramp::Vec{64,UInt32}) = _flip_words(_SIGN_PREP, base, ramp)
+
+# Extract lanes [o, o+W) of a Vec{64} as a Vec{W}.
+@inline _slice(v::Vec{64,T}, ::Val{o}, ::Val{W}) where {T,o,W} =
+    shufflevector(v, Val(ntuple(i -> i - 1 + o, Val(W))))
+
 @inline function _flip_words(prep::Prepared{Int8,64,<:AVX512}, base::UInt32, ramp::Vec{64,UInt32})
     idx = _phase_index(prep.backend, Vec{64,UInt32}(base) + ramp, Val(64), Int8)
     sv, cv = prep(idx)                                                          # quadrant ±1 (sin, cos)
     (_sign_pack(sv), _sign_pack(cv))
 end
-@inline _flip_words(::Prepared, base::UInt32, ramp::Vec{64,UInt32}) =
+@inline _flip_words(::Prepared, base::UInt32, ramp::Vec{64,UInt32}) =           # Portable / fallback
     (_msb_pack(Vec{64,UInt32}(base) + ramp),
      _msb_pack(Vec{64,UInt32}(base + 0x40000000) + ramp))
+
+# One W-lane chunk at accumulator offset `ramp_chunk`: (sin_bits, cos_bits) as UInt64 in lanes [0,W).
+@inline function _flip_chunk(prep, backend, base::UInt32, ramp_chunk::Vec{W,UInt32}) where {W}
+    s, c = prep(_phase_index(backend, Vec{W,UInt32}(base) + ramp_chunk, Val(64), Int8))
+    (_sign_pack(s), _sign_pack(c))
+end
+
+@static if Sys.ARCH in (:x86_64, :i686)
+    @inline _sign_pack(v::Vec{32,Int8}) = UInt64(Base.llvmcall(("""
+        define i32 @entry(<32 x i8> %v) #0 {
+          %c = icmp slt <32 x i8> %v, zeroinitializer
+          %m = bitcast <32 x i1> %c to i32
+          ret i32 %m }
+        attributes #0 = { alwaysinline }""", "entry"),
+        UInt32, Tuple{NTuple{32,Base.VecElement{Int8}}}, v.data))
+    @inline function _flip_words(prep::Prepared{Int8,64,<:AVX2}, base::UInt32, ramp::Vec{64,UInt32})
+        s0, c0 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(0),  Val(32)))
+        s1, c1 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(32), Val(32)))
+        (s0 | (s1 << 32), c0 | (c1 << 32))
+    end
+end
+
+@static if Sys.ARCH === :aarch64
+    @inline _sign_pack(v::Vec{16,Int8}) = UInt64(Base.llvmcall(("""
+        define i16 @entry(<16 x i8> %v) #0 {
+          %c = icmp slt <16 x i8> %v, zeroinitializer
+          %m = bitcast <16 x i1> %c to i16
+          ret i16 %m }
+        attributes #0 = { alwaysinline }""", "entry"),
+        UInt16, Tuple{NTuple{16,Base.VecElement{Int8}}}, v.data))
+    @inline function _flip_words(prep::Prepared{Int8,64,<:Neon}, base::UInt32, ramp::Vec{64,UInt32})
+        s0, c0 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(0),  Val(16)))
+        s1, c1 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(16), Val(16)))
+        s2, c2 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(32), Val(16)))
+        s3, c3 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(48), Val(16)))
+        (s0 | (s1 << 16) | (s2 << 32) | (s3 << 48),
+         c0 | (c1 << 16) | (c2 << 32) | (c3 << 48))
+    end
+end
 
 function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractVector{UInt64},
                          n::Int, fw::UInt32, off::UInt32)

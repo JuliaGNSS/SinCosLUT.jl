@@ -292,6 +292,23 @@ end
             @test_throws DimensionMismatch generate_carrier_signs!(zeros(UInt64,1), c, n, 0x1)
             @test_throws ArgumentError generate_carrier_signs!(s, c, n, typemax(UInt32) + 1)
         end
+        # Cross-backend: the SIMD-chunked flip path (AVX2 2×32; the AVX-512 64-lane and NEON 4×16
+        # paths are the default backend, covered by the ref_signs tests above on their CI) must match
+        # the generic UInt32 sign-mask (Portable fallback) bit-for-bit. Forced backends, so this runs
+        # wherever the ISA is present regardless of the default choice.
+        @static if Sys.ARCH in (:x86_64, :i686)
+            if SinCosLUT.HOST_FEATURES.avx2
+                using SinCosLUT: _SIGN_TABLE, _flip_words, _iota_u32, AVX2, Portable, prepare
+                pp = prepare(_SIGN_TABLE; backend = Portable())
+                pa = prepare(_SIGN_TABLE; backend = AVX2())
+                @testset "AVX2 flip path fw=$(repr(fw))" for fw in
+                        (0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd, 0x00012345, 0x7ffffff0)
+                    ramp = _iota_u32() * SIMD.Vec{64,UInt32}(fw)
+                    @test all(base -> _flip_words(pa, base, ramp) == _flip_words(pp, base, ramp),
+                              UInt32.((0x0, 0x12345678, 0x80000000, 0xabcdef01)))
+                end
+            end
+        end
     end
 
     println("default backends: ",
