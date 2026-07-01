@@ -1,5 +1,19 @@
 # Changelog
 
+# [3.1.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.0.1...v3.1.0) (2026-07-01)
+
+
+### Features
+
+* 1-bit carrier generation (generate_carrier_signs!) ([381c4ba](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/381c4bab33dd9cfe9a76495c0c1591c4d4d969ed)), closes [hi#frequency](https://github.com/hi/issues/frequency)
+
+
+### Performance Improvements
+
+* AVX2 and NEON fast paths for the sign-flip lookup ([6b081da](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/6b081daf9c9614457ab5fb7da670b16d7d1c0e23))
+* LUT-backed sign lookup for the sign-flip path (uniformly fastest) ([327ce00](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/327ce0017e9c9ba56d26e132e71f1b1f45740323))
+* pack sign flips with a SIMD sign-mask — fast at any frequency ([88b6456](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/88b6456555626a06fed9f14ccbe42546705a9d49)), closes [hi#frequency](https://github.com/hi/issues/frequency)
+
 ## [3.0.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.0.0...v3.0.1) (2026-06-26)
 
 
