@@ -24,10 +24,9 @@
 # Lane ramp [0,1,…,63] as a compile-time-constant Vec (folded to a literal).
 @inline @generated _iota_u32() = :(Vec{64,UInt32}($(Expr(:tuple, (UInt32(j) for j in 0:63)...))))
 
-# Pack the sign bit (MSB) of 64 `UInt32` lanes into a `UInt64`: bit j set ⇔ lane j has its top
-# bit set (interpreted as a signed `Int32`, that lane is negative). Portable LLVM (an `icmp` +
-# `<64 x i1>→i64` bitcast); lowers to `vpmovd2m`+kmov on AVX-512, a compare/movemask sequence on
-# AVX2/NEON, and scalar elsewhere — always correct.
+# Pack the sign bit (MSB) of 64 lanes into a `UInt64`: bit j set ⇔ lane j is negative as a signed
+# integer. Portable LLVM (an `icmp` + `<64 x i1>→i64` bitcast); lowers to `vpmov{d,b}2m`+kmov on
+# AVX-512, a compare/movemask sequence on AVX2/NEON, and scalar elsewhere — always correct.
 @inline _msb_pack(v::Vec{64,UInt32}) = Base.llvmcall(("""
     define i64 @entry(<64 x i32> %v) #0 {
       %c = icmp slt <64 x i32> %v, zeroinitializer
@@ -35,19 +34,37 @@
       ret i64 %m }
     attributes #0 = { alwaysinline }""", "entry"),
     UInt64, Tuple{NTuple{64,Base.VecElement{Int32}}}, reinterpret(Vec{64,Int32}, v).data)
+@inline _sign_pack(v::Vec{64,Int8}) = Base.llvmcall(("""
+    define i64 @entry(<64 x i8> %v) #0 {
+      %c = icmp slt <64 x i8> %v, zeroinitializer
+      %m = bitcast <64 x i1> %c to i64
+      ret i64 %m }
+    attributes #0 = { alwaysinline }""", "entry"),
+    UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
 
-# Sign bits of one 64-sample word. `b` is the accumulator at the word's first sample; lane j has
-# accumulator `b + ramp[j]` (`ramp[j] = j·freq_word`). `span = 63·freq_word`. `single_flip` asserts
-# the word advances < ½ cycle (so ≤ 1 sign flip): then equal endpoints ⇒ a constant run written in
-# one store; anything else is packed with the SIMD sign-mask. Only the low `rem` (≤64) bits are kept.
-@inline function _sign_word(b::UInt32, ramp::Vec{64,UInt32}, span::UInt32, rem::Int, single_flip::Bool)
-    word = if single_flip && _msb(b) == _msb(b + span)
-        _msb(b) ? typemax(UInt64) : zero(UInt64)            # constant run — one store
-    else
-        _msb_pack(Vec{64,UInt32}(b) + ramp)                 # ≥1 flip inside — one SIMD sign-mask
-    end
-    rem == 64 ? word : word & ((UInt64(1) << rem) - UInt64(1))
+# Quadrant-sign table (N=64): entry k is the SIGN of sin/cos in quadrant k, ±1 as Int8. Permuting
+# it by the phase index recovers the exact MSB sign (the sign depends only on the index's top bit,
+# which is the accumulator MSB — no zero-crossing rounding as a value table would have). The cos
+# column bakes in the ¼-cycle offset, so one index feeds both. `_SIGN_PREP` materialises it in
+# registers once (default backend const-folds). This is only USED on the AVX-512 (W=64) path below;
+# on other widths the `_msb_pack` sign-mask is used, so the prepared table just sits unused there.
+const _SIGN_TABLE = SinCosTable{Int8,64}(
+    ntuple(k -> (k - 1) < 32 ? Int8(1) : Int8(-1), Val(64)),                    # sin<0 ⇔ k∈[32,64)
+    ntuple(k -> (16 ≤ (k - 1) < 48) ? Int8(-1) : Int8(1), Val(64)))            # cos<0 ⇔ k∈[16,48)
+const _SIGN_PREP = prepare(_SIGN_TABLE)
+
+# Sign words (sin, cos) of one full 64-sample word that contains ≥ 1 flip. AVX-512 path: one cheap
+# byte-gather index + a permute of the ±1 quadrant table (both columns) + two Int8 sign-masks —
+# ~2× cheaper than masking the 4-register UInt32 accumulator. Other backends: the UInt32 sign-mask.
+@inline _flip_words(base::UInt32, ramp::Vec{64,UInt32}) = _flip_words(_SIGN_PREP, base, ramp)
+@inline function _flip_words(prep::Prepared{Int8,64,<:AVX512}, base::UInt32, ramp::Vec{64,UInt32})
+    idx = _phase_index(prep.backend, Vec{64,UInt32}(base) + ramp, Val(64), Int8)
+    sv, cv = prep(idx)                                                          # quadrant ±1 (sin, cos)
+    (_sign_pack(sv), _sign_pack(cv))
 end
+@inline _flip_words(::Prepared, base::UInt32, ramp::Vec{64,UInt32}) =
+    (_msb_pack(Vec{64,UInt32}(base) + ramp),
+     _msb_pack(Vec{64,UInt32}(base + 0x40000000) + ramp))
 
 function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractVector{UInt64},
                          n::Int, fw::UInt32, off::UInt32)
@@ -58,11 +75,20 @@ function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractV
     # ≤ 1 sign flip per word ⇔ the word advances < ½ cycle ⇔ 64·fw < 2³¹ ⇔ fw < 2²⁵. Test fw
     # directly (NOT the wrapped `step`, which loses the whole-cycle count for a fast carrier).
     single_flip = fw < 0x02000000
+    mask(rem) = rem == 64 ? typemax(UInt64) : (UInt64(1) << rem) - UInt64(1)
     base = off                                 # accumulator at sample 0 (lane 0) = off
     @inbounds for w in 1:nwords
         rem = w == nwords ? n - (w - 1) * 64 : 64                       # valid lanes (tail may be < 64)
-        sin_signs[w] = _sign_word(base, ramp, span, rem, single_flip)
-        cos_signs[w] = _sign_word(base + 0x40000000, ramp, span, rem, single_flip)  # +¼ cycle
+        bc = base + 0x40000000                                          # cos accumulator (+¼ cycle)
+        sin_const = single_flip && _msb(base) == _msb(base + span)
+        cos_const = single_flip && _msb(bc)   == _msb(bc + span)
+        if sin_const & cos_const                                        # both constant → two stores
+            sin_signs[w] = (_msb(base) ? typemax(UInt64) : zero(UInt64)) & mask(rem)
+            cos_signs[w] = (_msb(bc)   ? typemax(UInt64) : zero(UInt64)) & mask(rem)
+        else                                                            # a flip inside → one lookup
+            sw, cw = _flip_words(base, ramp)
+            sin_signs[w] = sw & mask(rem); cos_signs[w] = cw & mask(rem)
+        end
         base += step
     end
     sin_signs, cos_signs
