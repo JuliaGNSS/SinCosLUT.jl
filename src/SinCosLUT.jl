@@ -78,7 +78,6 @@ end
 end
 include("kernel.jl")
 include("iterate.jl")
-include("signbits.jl")
 
 # ---- backend selection ----
 @static if Sys.ARCH in (:x86_64, :i686)
@@ -101,5 +100,7 @@ else
 end
 
 default_backend(table::SinCosTable{T,N}) where {T,N} = default_backend(T, N)
+
+include("signbits.jl")   # after default_backend: its `_SIGN_PREP` const prepares a table at load
 
 end # module
