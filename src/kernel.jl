@@ -102,13 +102,14 @@ end
 
 # Interleaved independent NCO accumulators let stores/lookups overlap. Hand-unrolled with
 # plain locals — a tuple/closure formulation boxes the reassigned state and is ~100× slower.
-# The interleave factor is a backend property: 4 streams on AVX-512/NEON (32 vector regs),
-# but 1 on AVX2 — its 16 YMM registers cannot hold 4×4 accumulator regs + the table, and the
-# resulting spills cost more than the interleave buys (measured: 1-stream is ~17% faster than
-# 4-stream on the AVX2 path; the only loop-carried dep is one vpaddd, so out-of-order
-# execution overlaps iterations without explicit interleave).
-_unroll(::Backend) = Val(4)
-_unroll(::AVX2)    = Val(1)
+# The interleave factor is a backend (and type) property: 4 streams by default (AVX-512 and
+# NEON have 32 vector regs), but 1 on AVX2 — its 16 YMM registers cannot hold 4×4 accumulator
+# regs + the table, and the resulting spills cost more than the interleave buys (measured:
+# 1-stream is ~17% faster than 4-stream on the AVX2 path; the only loop-carried dep is one
+# vpaddd, so out-of-order execution overlaps iterations without explicit interleave) — and
+# 2 for NEON Int16, whose 16 table registers would otherwise exhaust all 32 V regs.
+_unroll(::Backend, ::Type) = Val(4)
+_unroll(::AVX2, ::Type{Int8}) = Val(1)
 # `_prepare` is hoisted here rather than inside `_generate_simd!`: for AVX2 its return TYPE
 # depends on the table's values (half-wave-symmetric fast layout vs generic fallback, see
 # permute_avx2.jl), so this call is a function barrier — one dynamic dispatch per fill, and
@@ -116,7 +117,7 @@ _unroll(::AVX2)    = Val(1)
 function _generate!(sin_out, cos_out, table::SinCosTable{T,N},
                     freq_word::UInt32, phase_offset, backend::Union{AVX512,AVX2,Neon}) where {T,N}
     _generate_simd!(sin_out, cos_out, table, freq_word, phase_offset, backend,
-                    _prepare(backend, table), _unroll(backend), _vwidth(backend, T))
+                    _prepare(backend, table), _unroll(backend, T), _vwidth(backend, T))
 end
 function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::UInt32,
                          phase_offset, backend, prepared_table, ::Val{4}, ::Val{W}) where {T,N,W}
@@ -158,7 +159,31 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::U
     end
     _generate_tail!(sin_out, cos_out, table, freq_word, acc_offset, chunk_start + 1)
 end
-# Single-stream variant (AVX2, see `_unroll`): one W-wide NCO, no leftover blocks.
+# Reduced-stream variants (see `_unroll`): 2-stream for NEON Int16, 1-stream for AVX2.
+function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::UInt32,
+                         phase_offset, backend, prepared_table, ::Val{2}, ::Val{W}) where {T,N,W}
+    acc_offset = _acc_offset(phase_offset, Val(N))
+    stride = 2W
+    step_advance = freq_word * UInt32(stride)
+    acc1 = _init_acc(Val(W), freq_word, acc_offset, 0)
+    acc2 = _init_acc(Val(W), freq_word, acc_offset, W)
+    num_samples = length(sin_out); chunk_start = 0
+    @inbounds while chunk_start + stride <= num_samples
+        s1, c1 = _apply(backend, prepared_table, _phase_index(backend, acc1, Val(N), T))
+        sin_out[VecRange{W}(chunk_start + 1)]     = s1; cos_out[VecRange{W}(chunk_start + 1)]     = c1
+        s2, c2 = _apply(backend, prepared_table, _phase_index(backend, acc2, Val(N), T))
+        sin_out[VecRange{W}(chunk_start + W + 1)] = s2; cos_out[VecRange{W}(chunk_start + W + 1)] = c2
+        acc1 += step_advance; acc2 += step_advance
+        chunk_start += stride
+    end
+    # ≤ 1 full W-block left: stream 1 is already positioned at chunk_start.
+    @inbounds if chunk_start + W <= num_samples
+        s1, c1 = _apply(backend, prepared_table, _phase_index(backend, acc1, Val(N), T))
+        sin_out[VecRange{W}(chunk_start + 1)] = s1; cos_out[VecRange{W}(chunk_start + 1)] = c1
+        chunk_start += W
+    end
+    _generate_tail!(sin_out, cos_out, table, freq_word, acc_offset, chunk_start + 1)
+end
 function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::UInt32,
                          phase_offset, backend, prepared_table, ::Val{1}, ::Val{W}) where {T,N,W}
     acc_offset = _acc_offset(phase_offset, Val(N))
