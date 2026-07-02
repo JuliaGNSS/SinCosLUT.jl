@@ -32,26 +32,27 @@ cost, with no phase generation.
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=128 | **10.1** | 2.8e-2 | ~5  |
-| **SinCosLUT** Int8, steps=64  | **11.2** | 5.2e-2 | ~4  |
-| FixedPoint Int16 (Val 7)      | 103      | 1.3e-2 | ~6  |
-| FastSinCos `u100k`            | 187      | 3.2e-4 | ~12 |
-| FixedPoint Int32 (Val 8)      | 207      | 8.1e-3 | ~7  |
+| **SinCosLUT** Int8, steps=64  | **11.7** | 5.2e-2 | ~4  |
+| **SinCosLUT** Int8, steps=128 | **13.9** | 2.8e-2 | ~5  |
+| FixedPoint Int16 (Val 7)      | 105      | 1.3e-2 | ~6  |
+| FastSinCos `u100k`            | 190      | 3.2e-4 | ~12 |
+| FixedPoint Int32 (Val 8)      | 209      | 8.1e-3 | ~7  |
 | FastSinCos `u35`              | 229      | 6.0e-8 | ~24 |
-| FixedPoint Int32 (Val 14)     | 293      | 1.1e-4 | ~13 |
+| FixedPoint Int32 (Val 14)     | 297      | 1.1e-4 | ~13 |
 
 ### AVX2
 
-No native cross-lane byte permute (`vpermb` is unavailable); the lookup is emulated with
-a four-way `vpshufb`+blend split.
+No native cross-lane byte permute (`vpermb` is unavailable); the lookup is a half-table
+`vpshufb`+blend split plus a `psignb` sign flip (exploiting the table's half-wave
+anti-symmetry).
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64 | **42.7** | 5.2e-2 | ~4  |
-| FixedPoint Int16 (Val 7)     | 126      | 1.3e-2 | ~6  |
-| FixedPoint Int32 (Val 8)     | 246      | 8.1e-3 | ~7  |
-| FastSinCos `u100k`           | 254      | 3.2e-4 | ~12 |
-| FastSinCos `u35`             | 336      | 6.0e-8 | ~24 |
+| **SinCosLUT** Int8, steps=64 | **21.2** | 5.2e-2 | ~4  |
+| FixedPoint Int16 (Val 7)     | 123      | 1.3e-2 | ~6  |
+| FixedPoint Int32 (Val 8)     | 250      | 8.1e-3 | ~7  |
+| FastSinCos `u100k`           | 250      | 3.2e-4 | ~12 |
+| FastSinCos `u35`             | 327      | 6.0e-8 | ~24 |
 
 ## End-to-end carrier
 
@@ -65,36 +66,41 @@ accumulator (one add per step), so its carrier stays close to its bare kernel (�
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=128      | **17.3** | 4.3e-2 | ~5  |
-| **SinCosLUT** Int8, steps=64       | **17.5** | 9.3e-2 | ~3  |
-| FixedPoint Int16 (Val 7)           | 132      | 1.5e-2 | ~6  |
-| FastSinCos `u100k` (Float32 phase) | 239      | 3.1e-4 | ~12 |
-| FixedPoint Int32 (Val 13)          | 318      | 2.4e-4 | ~12 |
+| **SinCosLUT** Int8, steps=64       | **16.8** | 9.3e-2 | ~3  |
+| **SinCosLUT** Int8, steps=128      | **17.7** | 4.3e-2 | ~5  |
+| FixedPoint Int16 (Val 7)           | 131      | 1.5e-2 | ~6  |
+| FastSinCos `u100k` (Float32 phase) | 237      | 3.1e-4 | ~12 |
+| FixedPoint Int32 (Val 13)          | 317      | 2.4e-4 | ~12 |
 
 ### AVX2
 
 | method | ps/elem | max abs error | ~bits |
 | ------ | ------: | ------------: | ----: |
-| **SinCosLUT** Int8, steps=64       | **61.7** | 9.3e-2 | ~3  |
-| FixedPoint Int16 (Val 7)           | 145      | 1.5e-2 | ~6  |
-| FastSinCos `u100k` (Float32 phase) | 329      | 3.1e-4 | ~12 |
-| FixedPoint Int32 (Val 13)          | 390      | 2.4e-4 | ~12 |
+| **SinCosLUT** Int8, steps=64       | **47.8** | 9.3e-2 | ~3  |
+| FixedPoint Int16 (Val 7)           | 144      | 1.5e-2 | ~6  |
+| FastSinCos `u100k` (Float32 phase) | 328      | 3.1e-4 | ~12 |
+| FixedPoint Int32 (Val 13)          | 387      | 2.4e-4 | ~12 |
 
 ## Takeaways
 
 - **SinCosLUT is fastest on both AVX-512 and AVX2** — one `vpermb` per result on
-  AVX-512, a four-way `vpshufb`+blend split on AVX2 — but only ~4–5 bits accurate, set
-  by the table's phase resolution.
-- **AVX2 is ~3.5–4× slower than AVX-512** here (half the lanes, plus the four-way
-  emulation of the missing byte permute), yet still the fastest option at its accuracy —
-  it is no longer beaten by the polynomial packages.
+  AVX-512, a half-table `vpshufb`+blend split with a `psignb` sign flip on AVX2 — but
+  only ~4–5 bits accurate, set by the table's phase resolution.
+- **AVX2 is ~2–3× slower than AVX-512** here (half the lanes, plus the emulation of the
+  missing byte permute), yet still the fastest option at its accuracy by a wide margin —
+  the half-table split (v3.2) roughly doubled its kernel throughput over the earlier
+  four-way split.
 - On AVX-512 the **128-entry table** (two-register `vpermi2b`) doubles phase resolution
-  to ~5 bits at the same throughput as the 64-entry table, so it is the better default
-  there; AVX2's four-way split supports only the 64-entry table.
+  to ~5 bits for a ~20% kernel premium — and no carrier premium, where the NCO hides
+  it — so it is the better default there when the extra phase bit matters; the AVX2
+  split supports only the 64-entry table.
 - FixedPoint's drift-free DDA carrier is only marginally slower than its bare kernel
-  (132 vs 103 ps on AVX-512) — integer phase generation is nearly free. At ~6-bit
+  (131 vs 105 ps on AVX-512) — integer phase generation is nearly free. At ~6-bit
   accuracy FixedPoint Int16 is the fastest *polynomial* carrier; at float-grade accuracy
   FastSinCos edges FixedPoint Int32.
+- **NEON** (not in the x86 tables above): on the CI Apple M1 runner the Int8 carrier
+  runs at ~70 ps/elem, and the bytewise-`tbl` Int16 backend (v3.2) is ~2.2× faster than
+  the scalar fallback it replaces (~220 vs ~510 ps/elem).
 - **Pick by accuracy**: ≤5-bit → SinCosLUT (AVX-512/AVX2/NEON); ~6–13-bit integer →
   FixedPointSinCosApproximations; float-grade (12–24-bit) → FastSinCos. See
   [Choosing a package](@ref).

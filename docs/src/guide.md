@@ -99,16 +99,17 @@ The lookup primitive is picked automatically from the host CPU:
 | backend  | instruction        | types        | notes |
 | -------- | ------------------ | ------------ | ----- |
 | AVX-512  | `vpermb`/`vpermw`/`vpermd` (+`vpermi2*`) | Int8/16/32 | fastest |
-| AVX2     | `vpshufb` + blends | Int8 only    | 64-entry via 4-way split; ~3–4× slower than AVX-512 |
-| NEON     | `tbl` (`tbl4`)     | Int8 only    | AArch64; 16 lanes |
+| AVX2     | `vpshufb` + blends | Int8 only    | 64-entry table, half-table split + sign flip |
+| NEON     | `tbl` (`tbl4`)     | Int8, Int16  | AArch64; Int16 is looked up bytewise |
 | portable | scalar             | Int8/16/32   | always available |
 
-**AVX2 and NEON are `Int8`-only.** Their only register-resident table permute is a
-*byte* shuffle (`vpshufb` / `tbl`) — there is no word/dword permute (`vpermw`/`vpermd`
-are AVX-512). So on AVX2/NEON the SIMD lookup exists for `Int8` (`steps = 64`) only;
-`Int16`/`Int32` fall back to the (correct, but scalar) **portable** backend. If you need
-more amplitude bits on an AVX2 host, prefer a polynomial package over a wider SinCosLUT
-element type.
+**AVX2 and NEON have only a *byte* table permute** (`vpshufb` / `tbl`) — the word/dword
+permutes (`vpermw`/`vpermd`) are AVX-512. On AVX2 the SIMD lookup therefore exists for
+`Int8` (`steps = 64`) only. On NEON, `Int16` (`steps = 32` or `64`) is additionally
+served by looking the table up *bytewise* (each word index becomes its little-endian
+byte pair). `Int32` — and `Int16` on AVX2 — fall back to the (correct, but scalar)
+**portable** backend; at those accuracies, prefer a polynomial package over a wider
+SinCosLUT element type on such hosts.
 
 You can query the choice, or force one (e.g. for testing, or to skip the runtime CPU
 check):
