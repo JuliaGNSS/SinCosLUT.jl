@@ -72,14 +72,27 @@ _antisymmetric(values::NTuple{64,Int8}) = all(k -> values[k + 32] === -values[k]
 # prepare: 4-register half-table layout when the table is anti-symmetric (always true for
 # constructor-built tables), else the 8-register full-table fallback. Value-dependent
 # return TYPE — callers in kernel.jl hoist this behind a function barrier.
-@inline function _prepare(::AVX2, table::SinCosTable{Int8,64})
+@inline _prepare_full(::AVX2, table::SinCosTable{Int8,64}) =
+    (_subtable(table.sin, 0), _subtable(table.sin, 1), _subtable(table.sin, 2), _subtable(table.sin, 3),
+     _subtable(table.cos, 0), _subtable(table.cos, 1), _subtable(table.cos, 2), _subtable(table.cos, 3))
+@inline function _prepare(backend::AVX2, table::SinCosTable{Int8,64})
     if _antisymmetric(table.sin) && _antisymmetric(table.cos)
         (_subtable(table.sin, 0), _subtable(table.sin, 1),
          _subtable(table.cos, 0), _subtable(table.cos, 1))
     else
-        (_subtable(table.sin, 0), _subtable(table.sin, 1), _subtable(table.sin, 2), _subtable(table.sin, 3),
-         _subtable(table.cos, 0), _subtable(table.cos, 1), _subtable(table.cos, 2), _subtable(table.cos, 3))
+        _prepare_full(backend, table)
     end
+end
+
+# The value-based engine/`prepare` paths construct the register set and run the hot loop in
+# the SAME user function frame (see the iterate.jl examples), so the value-dependent Union
+# must be handled by the optimizer, not a barrier. Julia ≥ 1.12 does this allocation-free;
+# 1.10/1.11 box the engine per loop iteration (~16 B/iter measured). On old Julia those
+# paths therefore stick to the always-8-register layout — same speed as before this
+# optimization, still 0 allocations. The array kernels keep the fast layout everywhere:
+# their `_prepare` call site is a function barrier and union-splits statically even on 1.10.
+@static if VERSION < v"1.12"
+    @inline _prepare_engine(backend::AVX2, table::SinCosTable{Int8,64}) = _prepare_full(backend, table)
 end
 
 # fast path: 32-entry half lookup (bit 4 selects the sub-table) + conditional negate on
