@@ -100,15 +100,26 @@ end
     Vec{W,UInt32}(freq_word) * (_lanes_u32(Val(W)) + UInt32(start)) + Vec{W,UInt32}(acc_offset)
 end
 
-# 4 independent NCO accumulators run interleaved so their stores/lookups overlap.
-# Hand-unrolled with plain locals — a tuple/closure formulation boxes the reassigned
-# state and is ~100× slower.
+# Interleaved independent NCO accumulators let stores/lookups overlap. Hand-unrolled with
+# plain locals — a tuple/closure formulation boxes the reassigned state and is ~100× slower.
+# The interleave factor is a backend property: 4 streams on AVX-512/NEON (32 vector regs),
+# but 1 on AVX2 — its 16 YMM registers cannot hold 4×4 accumulator regs + the table, and the
+# resulting spills cost more than the interleave buys (measured: 1-stream is ~17% faster than
+# 4-stream on the AVX2 path; the only loop-carried dep is one vpaddd, so out-of-order
+# execution overlaps iterations without explicit interleave).
+_unroll(::Backend) = Val(4)
+_unroll(::AVX2)    = Val(1)
+# `_prepare` is hoisted here rather than inside `_generate_simd!`: for AVX2 its return TYPE
+# depends on the table's values (half-wave-symmetric fast layout vs generic fallback, see
+# permute_avx2.jl), so this call is a function barrier — one dynamic dispatch per fill, and
+# the kernel below compiles statically for whichever register layout comes back.
 function _generate!(sin_out, cos_out, table::SinCosTable{T,N},
                     freq_word::UInt32, phase_offset, backend::Union{AVX512,AVX2,Neon}) where {T,N}
-    _generate_simd!(sin_out, cos_out, table, freq_word, phase_offset, backend, _vwidth(backend, T))
+    _generate_simd!(sin_out, cos_out, table, freq_word, phase_offset, backend,
+                    _prepare(backend, table), _unroll(backend), _vwidth(backend, T))
 end
-function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
-                         freq_word::UInt32, phase_offset, backend, ::Val{W}) where {T,N,W}
+function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::UInt32,
+                         phase_offset, backend, prepared_table, ::Val{4}, ::Val{W}) where {T,N,W}
     acc_offset = _acc_offset(phase_offset, Val(N))
     stride = 4W
     step_advance = freq_word * UInt32(stride)              # accumulator advance per stride
@@ -116,7 +127,6 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
     acc2 = _init_acc(Val(W), freq_word, acc_offset, W)
     acc3 = _init_acc(Val(W), freq_word, acc_offset, 2W)
     acc4 = _init_acc(Val(W), freq_word, acc_offset, 3W)
-    prepared_table = _prepare(backend, table)              # materialise table in registers once
     num_samples = length(sin_out); chunk_start = 0
     @inbounds while chunk_start + stride <= num_samples
         # store each result immediately (keep ≤2 result vectors live → no spills);
@@ -145,6 +155,21 @@ function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N},
                 sin_out[VecRange{W}(chunk_start + 1)] = s3; cos_out[VecRange{W}(chunk_start + 1)] = c3; chunk_start += W
             end
         end
+    end
+    _generate_tail!(sin_out, cos_out, table, freq_word, acc_offset, chunk_start + 1)
+end
+# Single-stream variant (AVX2, see `_unroll`): one W-wide NCO, no leftover blocks.
+function _generate_simd!(sin_out, cos_out, table::SinCosTable{T,N}, freq_word::UInt32,
+                         phase_offset, backend, prepared_table, ::Val{1}, ::Val{W}) where {T,N,W}
+    acc_offset = _acc_offset(phase_offset, Val(N))
+    step_advance = freq_word * UInt32(W)
+    acc = _init_acc(Val(W), freq_word, acc_offset, 0)
+    num_samples = length(sin_out); chunk_start = 0
+    @inbounds while chunk_start + W <= num_samples
+        s, c = _apply(backend, prepared_table, _phase_index(backend, acc, Val(N), T))
+        sin_out[VecRange{W}(chunk_start + 1)] = s; cos_out[VecRange{W}(chunk_start + 1)] = c
+        acc += step_advance
+        chunk_start += W
     end
     _generate_tail!(sin_out, cos_out, table, freq_word, acc_offset, chunk_start + 1)
 end
@@ -177,14 +202,15 @@ function lookup_sincos!(sin_out::AbstractVector{T}, cos_out::AbstractVector{T},
     _lookup!(sin_out, cos_out, phase_indices, table, backend)
 end
 
+# _prepare hoisted for the same function-barrier reason as in _generate! above.
 function _lookup!(sin_out, cos_out, phase_indices, table::SinCosTable{T,N},
                   backend::Union{AVX512,AVX2,Neon}) where {T,N}
-    _lookup_simd!(sin_out, cos_out, phase_indices, table, backend, _vwidth(backend, T))
+    _lookup_simd!(sin_out, cos_out, phase_indices, table, backend,
+                  _prepare(backend, table), _vwidth(backend, T))
 end
 function _lookup_simd!(sin_out, cos_out, phase_indices, table::SinCosTable{T,N},
-                       backend, ::Val{W}) where {T,N,W}
+                       backend, prepared_table, ::Val{W}) where {T,N,W}
     index_mask = T(N - 1); num_samples = length(phase_indices); sample = 1
-    prepared_table = _prepare(backend, table)
     @inbounds while sample + W - 1 <= num_samples
         lane = VecRange{W}(sample)
         sin_vec, cos_vec = _apply(backend, prepared_table, phase_indices[lane] & index_mask)

@@ -99,6 +99,59 @@ end
         @test s == sref && c == cref
     end
 
+    # Forced-AVX2 coverage (also runs on hosts whose default backend is AVX-512): the
+    # symmetric 4-register half-table+psignb fast path, and the 8-register full-table
+    # fallback that a hand-built table violating value[k+32] == -value[k] must take.
+    @static if Sys.ARCH in (:x86_64, :i686)
+        if SinCosLUT.HOST_FEATURES.avx2
+            @testset "AVX2 symmetric fast path fw=$(repr(fw))" for fw in fws
+                tbl = SinCosTable(Int8; steps = 64)
+                s = zeros(Int8, L); c = zeros(Int8, L)
+                generate_carrier!(s, c, tbl, fw; backend = SinCosLUT.AVX2())
+                sref, cref = ref_carrier(Int8, 64, fw, L)
+                @test s == sref && c == cref
+            end
+            @testset "AVX2 asymmetric table falls back" begin
+                asym = SinCosLUT.SinCosTable{Int8,64}(ntuple(k -> Int8(k), Val(64)),
+                                                      ntuple(k -> Int8(3k % 127 - 63), Val(64)))
+                @test !SinCosLUT._antisymmetric(asym.sin)
+                s = zeros(Int8, L); c = zeros(Int8, L); s0 = zeros(Int8, L); c0 = zeros(Int8, L)
+                generate_carrier!(s, c, asym, FW; backend = SinCosLUT.AVX2())
+                generate_carrier!(s0, c0, asym, FW; backend = Portable())
+                @test s == s0 && c == c0
+                ph = rand(Int8, L)
+                lookup_sincos!(s, c, ph, asym; backend = SinCosLUT.AVX2())
+                lookup_sincos!(s0, c0, ph, asym; backend = Portable())
+                @test s == s0 && c == c0
+            end
+            @testset "AVX2 engine matches reference" begin
+                tbl = SinCosTable(Int8; steps = 64)
+                eng = carrier_engine(tbl, FW; backend = SinCosLUT.AVX2())
+                W = carrier_width(eng); st = carrier_state(eng)
+                s = zeros(Int8, L); c = zeros(Int8, L); i = 1
+                for _ in 1:(L ÷ W)
+                    sv, cv = carrier_lookup(eng, st)
+                    s[SIMD.VecRange{W}(i)] = sv; c[SIMD.VecRange{W}(i)] = cv; i += W
+                    st = carrier_advance(eng, st, 1)
+                end
+                nfull = (L ÷ W) * W
+                sref, cref = ref_carrier(Int8, 64, FW, L)
+                @test s[1:nfull] == sref[1:nfull] && c[1:nfull] == cref[1:nfull]
+            end
+            # the value-dependent _prepare return type must union-split statically — no
+            # boxing anywhere on the fill or fused paths
+            @testset "AVX2 paths allocation-free" begin
+                tbl = SinCosTable(Int8; steps = 64)
+                s = zeros(Int8, 4096); c = zeros(Int8, 4096)
+                _fill_probe(s, c, t, fw) =
+                    (generate_carrier!(s, c, t, fw; backend = SinCosLUT.AVX2()); nothing)
+                _fill_probe(s, c, tbl, FW)
+                @test (@allocated _fill_probe(s, c, tbl, FW)) == 0
+                @test alloc_of(tbl, SinCosLUT.AVX2()) == 0
+            end
+        end
+    end
+
     @testset "sincos_lut! matches carrier path" for (T, Ns) in cases, N in Ns
         tbl = SinCosTable(T; steps = N)
         phases = T[ (ref_idx(FW, N, i - 1) % T) for i in 1:L ]

@@ -141,11 +141,14 @@ _vwidth(::AVX512, ::Type{T}) where T = Val(regsize(T))
 # architecturally ignores index bits 7:6; N=64) or vpermi2b (ignores bit 7; N=128), and the
 # `Prepared` functor masks with `& (N-1)` before its permute. Do NOT use the raw result as an
 # arithmetic index without masking.
+# The explicit target-features matter: the asm 'x' constraint needs a ZMM register, and
+# under a restricted --cpu-target (e.g. a generic sysimage) the base target has none —
+# without the attribute LLVM fails with "couldn't allocate output register".
 @inline _opaque(v::Vec{64,Int8}) = Vec{64,Int8}(Base.llvmcall(("""
     define <64 x i8> @entry(<64 x i8> %v) #0 {
       %r = call <64 x i8> asm "", "=x,0"(<64 x i8> %v)
       ret <64 x i8> %r }
-    attributes #0 = { alwaysinline }""", "entry"),
+    attributes #0 = { alwaysinline "target-features"="+avx512vbmi,+avx512bw,+avx512f" }""", "entry"),
     NTuple{64,VecElement{Int8}}, Tuple{NTuple{64,VecElement{Int8}}}, v.data))
 
 # vpmultishiftqb: output byte j of each qword = the 8-bit field of the SOURCE qword starting
