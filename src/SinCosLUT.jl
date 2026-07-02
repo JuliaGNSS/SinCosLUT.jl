@@ -5,7 +5,7 @@ Fast SIMD sine/cosine via register-resident byte/word/dword table lookups.
 
 The lookup is a single hardware permute over a table held in vector registers:
 `vpermb`/`vpermw`/`vpermd` (AVX-512), `vpshufb` (AVX2, Int8 only), or NEON `tbl`
-(AArch64, Int8 only). Output element type is selectable — `Int8` (fastest,
+(AArch64, Int8 and Int16). Output element type is selectable — `Int8` (fastest,
 ~3-7 bit), `Int16`, or `Int32` (more amplitude precision, fewer lanes/entries).
 
 Accuracy is a deliberate trade for speed: a 512-bit register holds 64×Int8 but
@@ -99,7 +99,8 @@ include("iterate.jl")
     end
 elseif Sys.ARCH === :aarch64
     function default_backend(::Type{T}, steps::Integer) where T
-        (T === Int8 && steps == 64) ? Neon() : Portable()
+        (T === Int8 && steps == 64)                    ? Neon() :
+        (T === Int16 && (steps == 32 || steps == 64))  ? Neon() : Portable()
     end
 else
     default_backend(::Type{T}, steps::Integer) where T = Portable()
