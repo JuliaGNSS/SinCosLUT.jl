@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/JuliaGNSS/SinCosLUT.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/JuliaGNSS/SinCosLUT.jl/actions/workflows/CI.yml)
 [![codecov](https://codecov.io/gh/JuliaGNSS/SinCosLUT.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaGNSS/SinCosLUT.jl)
+[![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://JuliaGNSS.github.io/SinCosLUT.jl/stable)
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaGNSS.github.io/SinCosLUT.jl/dev)
 
 Fast SIMD sine/cosine by **register-resident table lookup**. Each `sin`/`cos` is a
@@ -65,6 +66,6 @@ speed/accuracy curve:
 | ~6–13-bit, integer output | [FixedPointSinCosApproximations.jl](https://github.com/JuliaGNSS/FixedPointSinCosApproximations.jl) |
 | float-grade, 12–24-bit | [FastSinCos.jl](https://github.com/JuliaGNSS/FastSinCos.jl) |
 
-> **Note** — the SIMD lookup runs on AVX-512 (all types), AVX2, and NEON (both `Int8`
-> only); other type/CPU combinations fall back to a correct scalar path. SVE2 is not
-> supported. See the [usage guide](https://JuliaGNSS.github.io/SinCosLUT.jl/dev/guide/#Choosing-a-backend).
+> **Note** — the SIMD lookup runs on AVX-512 (all types), AVX2 (`Int8`), and NEON
+> (`Int8` and `Int16`); other type/CPU combinations fall back to a correct scalar path.
+> SVE2 is not supported. See the [usage guide](https://JuliaGNSS.github.io/SinCosLUT.jl/dev/guide/#Choosing-a-backend).

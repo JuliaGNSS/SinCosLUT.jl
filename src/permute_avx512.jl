@@ -33,13 +33,20 @@ end
     """, UInt32, Tuple{UInt32}, UInt32(0))
 
 function _x86_features()
+    # leaf 0: vendor string ("GenuineIntel" in EBX,EDX,ECX). Intel AVX-512 cores execute all
+    # byte permutes on a single shuffle port (port 5), so the phase-index extraction picks a
+    # port-balanced instruction mix there; AMD double-pumps 512-bit ops across 256-bit pipes,
+    # making TOTAL µops the binding constraint instead (see _phase_index below).
+    _, ebx0, ecx0, edx0 = _cpuid(UInt32(0), UInt32(0))
+    intel = ebx0 == 0x756e6547 && edx0 == 0x49656e69 && ecx0 == 0x6c65746e
     _, _, ecx1, _ = _cpuid(UInt32(1), UInt32(0))     # leaf 1: OSXSAVE in ECX bit 27
     osxsave = _bit(ecx1, 27)
     xcr0 = osxsave ? _xcr0() : UInt32(0)
     avx_os    = osxsave && _bit(xcr0, 1) && _bit(xcr0, 2)                      # SSE + YMM state
     avx512_os = avx_os  && _bit(xcr0, 5) && _bit(xcr0, 6) && _bit(xcr0, 7)    # opmask + ZMM state
     _, ebx, ecx, _ = _cpuid(UInt32(7), UInt32(0))    # leaf 7: feature bits
-    (avx2       = avx_os    && _bit(ebx, 5),
+    (intel      = intel,
+     avx2       = avx_os    && _bit(ebx, 5),
      avx512f    = avx512_os && _bit(ebx, 16),
      avx512bw   = avx512_os && _bit(ebx, 30),
      avx512vbmi = avx512_os && _bit(ecx, 1))
@@ -107,27 +114,98 @@ _vwidth(::AVX512, ::Type{T}) where T = Val(regsize(T))
 
 # Fast Int8 phase→index extraction (overrides the generic shift+convert in kernel.jl).
 # `convert(Vec{64,UInt32} -> Int8)` lowers to 4×vpmovdb + 3×inserts (7 shuffle-port µops),
-# and the shuffle port is the bottleneck of both the value-based carrier loop and the fill.
+# and shuffle work is the bottleneck of both the value-based carrier loop and the fill.
 # The table index is the top log2(N) bits of each lane, which sit entirely in byte 3 of the
 # little-endian UInt32. Gather byte 3 of all 64 lanes with two `vpermi2b` over the accumulator's
-# four byte-quarters (the quarter splits are free sub-register selects) plus one merge — 3
-# shuffle-port µops — then right-align (index = byte3 >> (8-log2(N)) = byte3 >> (index_shift-24))
-# and mask to N-1. The byte shift can bleed a neighbour lane's low bits into bits ≥ log2(N);
-# the `& (N-1)` clears them, so the result is exact. The gather index selects vpermi2b's
-# 0–63 = first operand, 64–127 = second; lanes 32–63 are don't-care (overwritten by the merge).
+# four byte-quarters (the quarter splits are free sub-register selects): the lo gather fills
+# lanes 0–31 from dwords 0–31, the hi gather fills lanes 32–63 from dwords 32–63 (vpermi2b
+# index 0–63 = first operand, 64–127 = second; each gather's other half is don't-care). The
+# halves are merged with a `vpternlogq` bit-select — NOT a lane shuffle: the select mask is
+# routed through an empty-asm barrier (`_opaque`), otherwise LLVM canonicalises the constant-
+# mask select back into a 3rd shuffle-port op (vshufi64x2/vinserti64x4), re-creating the port-5
+# bottleneck on Intel. ternlog runs on the plain vector-ALU ports, which have slack here.
+#
+# The gathered byte still holds the index at bits [7 : 8-log2(N)] and must be right-aligned.
+# Two tails, chosen per vendor at precompile (HOST_FEATURES is const, so the branch folds):
+#   • AMD & others (512-bit ops double-pumped over 256-bit pipes → TOTAL µops bind):
+#     one `vpmultishiftqb` per-byte bit-field extract (VBMI, which this path requires anyway).
+#     x86 has no byte-granular shift — a plain `>>` lowers to vpsrlw+vpand (2 ops) — so the
+#     1-op multishift wins. Its field wraps neighbouring bits into index bits ≥ log2(N):
+#     the RESULT IS NOT EXACT — junk in bits the consumers ignore (see contract below).
+#   • Intel (full 512-bit units, all byte permutes contend on port 5 → port 5 binds):
+#     vpsrlw+vpand — 2 µops, but on the ALU ports where there is slack; adding multishift
+#     would put a 3rd op on port 5 instead. This tail is exact.
+#
+# CONTRACT: bits ≥ log2(N) of each returned index byte are UNSPECIFIED (junk on the AMD tail,
+# zero on the Intel tail). Every consumer is safe: `_apply(::AVX512, …)` feeds vpermb (which
+# architecturally ignores index bits 7:6; N=64) or vpermi2b (ignores bit 7; N=128), and the
+# `Prepared` functor masks with `& (N-1)` before its permute. Do NOT use the raw result as an
+# arithmetic index without masking.
+# The explicit target-features matter: the asm 'x' constraint needs a ZMM register, and
+# under a restricted --cpu-target (e.g. a generic sysimage) the base target has none —
+# without the attribute LLVM fails with "couldn't allocate output register".
+@inline _opaque(v::Vec{64,Int8}) = Vec{64,Int8}(Base.llvmcall(("""
+    define <64 x i8> @entry(<64 x i8> %v) #0 {
+      %r = call <64 x i8> asm "", "=x,0"(<64 x i8> %v)
+      ret <64 x i8> %r }
+    attributes #0 = { alwaysinline "target-features"="+avx512vbmi,+avx512bw,+avx512f" }""", "entry"),
+    NTuple{64,VecElement{Int8}}, Tuple{NTuple{64,VecElement{Int8}}}, v.data))
+
+# vpmultishiftqb: output byte j of each qword = the 8-bit field of the SOURCE qword starting
+# at bit ctrl[j] (circular within the qword). One op ≡ per-byte `>> shift` with junk, not
+# zeros, shifted into the top bits.
+const _MULTISHIFT_IR = """
+declare <64 x i8> @llvm.x86.avx512.pmultishift.qb.512(<64 x i8>, <64 x i8>)
+define <64 x i8> @entry(<64 x i8> %c, <64 x i8> %v) #0 {
+  %r = call <64 x i8> @llvm.x86.avx512.pmultishift.qb.512(<64 x i8> %c, <64 x i8> %v)
+  ret <64 x i8> %r }
+attributes #0 = { alwaysinline "target-features"="+avx512vbmi,+avx512bw,+avx512f" }
+"""
+@inline _multishift(ctrl::Vec{64,Int8}, v::Vec{64,Int8}) =
+    Vec{64,Int8}(Base.llvmcall((_MULTISHIFT_IR, "entry"), NTuple{64,VecElement{Int8}},
+        Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, ctrl.data, v.data))
+
 @inline function _phase_index(::AVX512, acc::Vec{64,UInt32}, ::Val{N}, ::Type{Int8}) where {N}
     b = reinterpret(Vec{256,Int8}, acc)
     q0 = shufflevector(b, Val(ntuple(i -> i - 1, Val(64))))
     q1 = shufflevector(b, Val(ntuple(i -> i + 63, Val(64))))
     q2 = shufflevector(b, Val(ntuple(i -> i + 127, Val(64))))
     q3 = shufflevector(b, Val(ntuple(i -> i + 191, Val(64))))
-    gather = Vec{64,Int8}(ntuple(
+    gather_lo = Vec{64,Int8}(ntuple(
         k -> k <= 16 ? Int8(4 * (k - 1) + 3) : (k <= 32 ? Int8(64 + 4 * (k - 17) + 3) : Int8(0)),
         Val(64)))
-    lo = _permi2(q0, gather, q1)                         # lanes 0..31 = byte 3 of dwords 0..31
-    hi = _permi2(q2, gather, q3)                         # lanes 0..31 = byte 3 of dwords 32..63
-    msbyte = shufflevector(lo, hi, Val(ntuple(k -> k <= 32 ? k - 1 : 64 + (k - 33), Val(64))))
-    reinterpret(Vec{64,Int8}, (msbyte >> UInt8(_index_shift(Val(N)) - 24)) & UInt8(N - 1))
+    gather_hi = Vec{64,Int8}(ntuple(
+        k -> k <= 32 ? Int8(0) :
+             (k <= 48 ? Int8(4 * (k - 33) + 3) : Int8(64 + 4 * (k - 49) + 3)),
+        Val(64)))
+    lo = _permi2(q0, gather_lo, q1)                      # lanes 0..31 = byte 3 of dwords 0..31
+    hi = _permi2(q2, gather_hi, q3)                      # lanes 32..63 = byte 3 of dwords 32..63
+    m = _opaque(Vec{64,Int8}(ntuple(k -> k <= 32 ? Int8(-1) : Int8(0), Val(64))))
+    msbyte = (lo & m) | (hi & ~m)                        # one vpternlogq (vector-ALU, not shuffle)
+    shift = _index_shift(Val(N)) - 24                    # byte3 >> shift right-aligns the index
+    # plain `if` (not @static: the whole file is one @static block, so HOST_FEATURES does not
+    # exist yet at macro-expansion time) — HOST_FEATURES is const, so the branch folds away.
+    if HOST_FEATURES.intel
+        reinterpret(Vec{64,Int8}, (msbyte >> UInt8(shift)) & UInt8(N - 1))
+    else
+        ctrl = Vec{64,Int8}(ntuple(i -> Int8(8 * ((i - 1) & 7) + shift), Val(64)))
+        _multishift(ctrl, msbyte)
+    end
+end
+
+# Fast Int16 phase→index extraction. The generic form costs 2×vpsrld + a narrowing
+# `convert(Vec{32,UInt32} -> Int16)` (2×vpmovdw + insert — 3 shuffle µops). The index lives in
+# the HIGH word of each dword (bits 31:16, and log2(N) ≤ 16 always), so a single `vpermi2w`
+# gathers the high words of all 32 lanes across the accumulator's two halves, and one logical
+# word shift right-aligns it — 2 ops total, and EXACT (a word shift zero-fills; nothing bleeds).
+@inline function _phase_index(::AVX512, acc::Vec{32,UInt32}, ::Val{N}, ::Type{Int16}) where {N}
+    w = reinterpret(Vec{64,Int16}, acc)
+    h0 = shufflevector(w, Val(ntuple(i -> i - 1, Val(32))))    # words of dwords 0..15
+    h1 = shufflevector(w, Val(ntuple(i -> i + 31, Val(32))))   # words of dwords 16..31
+    gather = Vec{32,Int16}(ntuple(k -> Int16(2k - 1), Val(32)))  # word 1 (high) of each dword
+    hiw = _permi2(h0, gather, h1)
+    reinterpret(Vec{32,Int16},
+        reinterpret(Vec{32,UInt16}, hiw) >> UInt16(_index_shift(Val(N)) - 16))
 end
 
 end # @static x86

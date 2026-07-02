@@ -5,7 +5,7 @@ Fast SIMD sine/cosine via register-resident byte/word/dword table lookups.
 
 The lookup is a single hardware permute over a table held in vector registers:
 `vpermb`/`vpermw`/`vpermd` (AVX-512), `vpshufb` (AVX2, Int8 only), or NEON `tbl`
-(AArch64, Int8 only). Output element type is selectable — `Int8` (fastest,
+(AArch64, Int8 and Int16). Output element type is selectable — `Int8` (fastest,
 ~3-7 bit), `Int16`, or `Int32` (more amplitude precision, fewer lanes/entries).
 
 Accuracy is a deliberate trade for speed: a 512-bit register holds 64×Int8 but
@@ -29,7 +29,7 @@ export SinCosTable, generate_carrier!, generate_carrier_signs!, lookup_sincos!, 
 abstract type Backend end
 struct AVX512  <: Backend end   # vpermb / vpermw / vpermd (+vpermi2*)
 struct AVX2    <: Backend end   # vpshufb (Int8 only)
-struct Neon    <: Backend end   # AArch64 NEON tbl (Int8 only)
+struct Neon    <: Backend end   # AArch64 NEON tbl (Int8, Int16)
 struct Portable <: Backend end  # scalar fallback (any T)
 
 """
@@ -99,7 +99,8 @@ include("iterate.jl")
     end
 elseif Sys.ARCH === :aarch64
     function default_backend(::Type{T}, steps::Integer) where T
-        (T === Int8 && steps == 64) ? Neon() : Portable()
+        (T === Int8 && steps == 64)                    ? Neon() :
+        (T === Int16 && (steps == 32 || steps == 64))  ? Neon() : Portable()
     end
 else
     default_backend(::Type{T}, steps::Integer) where T = Portable()
@@ -111,8 +112,9 @@ end
 
 The lookup backend automatically selected for output type `T` and table size `steps` on
 the host CPU: `AVX512()`, `AVX2()`, or `Neon()` where the required SIMD permute is
-available, otherwise `Portable()` (the always-correct scalar fallback). AVX2 and NEON
-support only `Int8` with `steps = 64`; wider types or sizes fall back to `Portable()`.
+available, otherwise `Portable()` (the always-correct scalar fallback). AVX2 supports
+only `Int8` with `steps = 64`; NEON supports `Int8` (`steps = 64`) and `Int16`
+(`steps = 32` or `64`); other combinations fall back to `Portable()`.
 Pass the result (or any `Backend`) as the `backend` keyword of [`generate_carrier!`](@ref),
 [`lookup_sincos!`](@ref), [`carrier_engine`](@ref), or [`prepare`](@ref) to override the
 choice. See [`backend_name`](@ref) for a readable label.

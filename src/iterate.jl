@@ -32,15 +32,24 @@ end
 Prepared{T,N}(table_registers::R, backend::B, index_mask::T) where {T,N,B,R} =
     Prepared{T,N,B,R}(table_registers, backend, index_mask)
 
+# Register layout for the value-based paths (this file): same as `_prepare` except on
+# AVX2 + Julia < 1.12, where the value-dependent fast layout would box in user loops —
+# see the version-gated override in permute_avx2.jl.
+@inline _prepare_engine(backend, table::SinCosTable) = _prepare(backend, table)
+
 """
     prepare(table; backend=default_backend(table)) -> callable
 
 Materialise `table` into registers once and return a callable `p` such that
 `p(phase_index::Vec) -> (sin::Vec, cos::Vec)` (indices taken mod `steps`). Analogous
 to `FastSinCos`'s `fast_sincos_*`, but a table lookup.
+
+The callable's concrete type can depend on the table's VALUES (the AVX2 backend picks a
+smaller register layout for the half-wave-symmetric tables the constructor builds), so
+build it once outside hot loops.
 """
 prepare(table::SinCosTable{T,N}; backend::Backend = default_backend(T, N)) where {T,N} =
-    Prepared{T,N}(_prepare(backend, table), backend, T(N - 1))
+    Prepared{T,N}(_prepare_engine(backend, table), backend, T(N - 1))
 
 @inline (p::Prepared{T,N})(phase_index::Vec{W,T}) where {T,N,W} =
     _apply(p.backend, p.table_registers, phase_index & p.index_mask)
@@ -99,7 +108,7 @@ carrier_engine(table::SinCosTable; frequency::Real, sampling_frequency::Real, kw
     carrier_engine(table, cycles_per_sample(frequency, sampling_frequency); kw...)
 
 function _make_engine(table::SinCosTable{T,N}, freq_word::UInt32, backend, ::Val{W}) where {T,N,W}
-    prepared = Prepared{T,N}(_prepare(backend, table), backend, T(N - 1))
+    prepared = Prepared{T,N}(_prepare_engine(backend, table), backend, T(N - 1))
     CarrierEngine{T,N,W,typeof(prepared)}(prepared, freq_word)
 end
 
@@ -116,13 +125,19 @@ added to every lane: an `Integer` is table steps, a `Real` is cycles.
     CarrierState{W}(_init_acc(Val(W), eng.freq_word, acc_offset, Int(start)))
 end
 
+# Calls _apply directly rather than the `Prepared` functor: the functor's `& index_mask`
+# guards arbitrary user-supplied indices, but `_phase_index` already returns an _apply-safe
+# index for its own backend (exact everywhere except AVX-512 Int8, whose junk sits in bits
+# the hardware permute ignores — see its contract in permute_avx512.jl), so the mask is a
+# wasted op in this hot loop.
 """
     carrier_lookup(eng::CarrierEngine, st::CarrierState) -> (sin::Vec{W,T}, cos::Vec{W,T})
 
 The `(sin, cos)` chunk at `st`'s current phase. Pure read — does not advance the state.
 """
 @inline carrier_lookup(eng::CarrierEngine{T,N,W}, st::CarrierState{W}) where {T,N,W} =
-    eng.prepared(_phase_index(eng.prepared.backend, st.acc, Val(N), T))
+    _apply(eng.prepared.backend, eng.prepared.table_registers,
+           _phase_index(eng.prepared.backend, st.acc, Val(N), T))
 
 """
     carrier_advance(eng::CarrierEngine, st::CarrierState, nchunks::Integer) -> CarrierState

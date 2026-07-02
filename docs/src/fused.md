@@ -86,13 +86,15 @@ fill4!(sins, coss, tbl, 0.002)
 sins[1:8]
 ```
 
-At scale this matches `generate_carrier!` (which is itself a 4-way interleave
-internally).
+At scale this matches `generate_carrier!` (which interleaves internally — 4 streams
+where registers allow, fewer where they don't: AVX2's 16 registers favour a single
+stream, NEON's Int16 tables leave room for 2).
 
 !!! tip "How many streams?"
     Use a **single stream** when you fuse into nontrivial work — it borrows the ILP of
     your own loop. Use a **4-way interleave** (or just `generate_carrier!`) when the
-    per-sample work is light.
+    per-sample work is light — except on AVX2, where 4×4 accumulator registers plus the
+    table exceed the 16 YMM registers and the spills cost more than the interleave buys.
 
 ## The stateless primitive
 
