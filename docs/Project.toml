@@ -1,6 +1,15 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
 SinCosLUT = "59c743cf-042e-44de-8bbe-9da51d41dc19"
+
+# SinCosLUT (this repo) is resolved from its path directly (Julia ≥ 1.11), so a bare
+# `Pkg.instantiate()` builds the docs against the working tree — the `@example` blocks
+# on every page run against the code as it is right now, which is what keeps them from
+# going stale. (julia-actions/julia-docdeploy also dev-installs it; the two agree.)
+[sources]
+SinCosLUT = {path = ".."}
 
 [compat]
 Documenter = "1"
+SIMD = "3"

@@ -32,6 +32,12 @@ struct AVX2    <: Backend end   # vpshufb (Int8 only)
 struct Neon    <: Backend end   # AArch64 NEON tbl (Int8 only)
 struct Portable <: Backend end  # scalar fallback (any T)
 
+"""
+    backend_name(backend) -> String
+
+Human-readable name of a `Backend` (`"AVX-512"`, `"AVX2"`, `"NEON"`, or `"portable"`).
+Useful for reporting which lookup primitive [`default_backend`](@ref) selected.
+"""
 backend_name(::AVX512)   = "AVX-512"
 backend_name(::AVX2)     = "AVX2"
 backend_name(::Neon)     = "NEON"
@@ -99,6 +105,18 @@ else
     default_backend(::Type{T}, steps::Integer) where T = Portable()
 end
 
+"""
+    default_backend(table::SinCosTable) -> Backend
+    default_backend(T::Type, steps::Integer) -> Backend
+
+The lookup backend automatically selected for output type `T` and table size `steps` on
+the host CPU: `AVX512()`, `AVX2()`, or `Neon()` where the required SIMD permute is
+available, otherwise `Portable()` (the always-correct scalar fallback). AVX2 and NEON
+support only `Int8` with `steps = 64`; wider types or sizes fall back to `Portable()`.
+Pass the result (or any `Backend`) as the `backend` keyword of [`generate_carrier!`](@ref),
+[`lookup_sincos!`](@ref), [`carrier_engine`](@ref), or [`prepare`](@ref) to override the
+choice. See [`backend_name`](@ref) for a readable label.
+"""
 default_backend(table::SinCosTable{T,N}) where {T,N} = default_backend(T, N)
 
 include("signbits.jl")   # after default_backend: its `_SIGN_PREP` const prepares a table at load
