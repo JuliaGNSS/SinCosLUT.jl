@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.1.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.1.0...v3.1.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* **avx2:** keep the value-based paths type-stable on Julia < 1.12 ([8a3241f](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/8a3241f9372af42b8ae06b82381c5e70de9d246a))
+
+
+### Performance Improvements
+
+* **avx2:** half-table psignb lookup, packed index extraction, 1-stream fill ([70f94a5](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/70f94a56de72390949cd766e096a1d54432d08cc))
+* **avx512:** cheaper phase-index extraction (ternlog merge, vendor-tuned align, Int16 word-gather) ([15c59ae](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/15c59ae176c46eb129399b2d54d8496e33ec5a11))
+* feed permutes directly, skipping the Prepared functor's re-mask ([428fe7e](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/428fe7e206cbc8c42abc7b851dccccaed56c0ddb))
+* **neon:** Int16 NEON backend via byte-pair tbl, exact byte-shift index ([57d94c5](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/57d94c5b6a0732a243867fc97b3fb8700395d059))
+* **neon:** uzp2-chain phase-index extraction instead of tbl gathers ([134b3f1](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/134b3f13a3aa48fa24e6788ed96ab32e1fe20932))
+
 # [3.1.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.0.1...v3.1.0) (2026-07-01)
 
 
