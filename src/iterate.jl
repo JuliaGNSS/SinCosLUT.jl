@@ -121,8 +121,14 @@ end
 
 The `(sin, cos)` chunk at `st`'s current phase. Pure read — does not advance the state.
 """
+# Calls _apply directly rather than the `Prepared` functor: the functor's `& index_mask`
+# guards arbitrary user-supplied indices, but `_phase_index` already returns an _apply-safe
+# index for its own backend (exact everywhere except AVX-512 Int8, whose junk sits in bits
+# the hardware permute ignores — see its contract in permute_avx512.jl), so the mask is a
+# wasted op in this hot loop.
 @inline carrier_lookup(eng::CarrierEngine{T,N,W}, st::CarrierState{W}) where {T,N,W} =
-    eng.prepared(_phase_index(eng.prepared.backend, st.acc, Val(N), T))
+    _apply(eng.prepared.backend, eng.prepared.table_registers,
+           _phase_index(eng.prepared.backend, st.acc, Val(N), T))
 
 """
     carrier_advance(eng::CarrierEngine, st::CarrierState, nchunks::Integer) -> CarrierState

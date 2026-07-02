@@ -69,7 +69,9 @@ const _SIGN_PREP = prepare(_SIGN_TABLE)
 
 @inline function _flip_words(prep::Prepared{Int8,64,<:AVX512}, base::UInt32, ramp::Vec{64,UInt32})
     idx = _phase_index(prep.backend, Vec{64,UInt32}(base) + ramp, Val(64), Int8)
-    sv, cv = prep(idx)                                                          # quadrant ±1 (sin, cos)
+    # _apply directly (not the functor): _phase_index is _apply-safe for its backend, so the
+    # functor's `& index_mask` would be a wasted op (see carrier_lookup / _phase_index docs).
+    sv, cv = _apply(prep.backend, prep.table_registers, idx)                    # quadrant ±1 (sin, cos)
     (_sign_pack(sv), _sign_pack(cv))
 end
 @inline _flip_words(::Prepared, base::UInt32, ramp::Vec{64,UInt32}) =           # Portable / fallback
@@ -78,7 +80,8 @@ end
 
 # One W-lane chunk at accumulator offset `ramp_chunk`: (sin_bits, cos_bits) as UInt64 in lanes [0,W).
 @inline function _flip_chunk(prep, backend, base::UInt32, ramp_chunk::Vec{W,UInt32}) where {W}
-    s, c = prep(_phase_index(backend, Vec{W,UInt32}(base) + ramp_chunk, Val(64), Int8))
+    s, c = _apply(backend, prep.table_registers,
+                  _phase_index(backend, Vec{W,UInt32}(base) + ramp_chunk, Val(64), Int8))
     (_sign_pack(s), _sign_pack(c))
 end
 
