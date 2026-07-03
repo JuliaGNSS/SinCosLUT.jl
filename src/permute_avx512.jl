@@ -74,7 +74,9 @@ const HOST_FEATURES = _x86_features()
 # Any other target (a named CPU, or a multiversion string) falls back to `Portable()` — always
 # correct, and the only ISA a baseline clone is guaranteed to be able to emit. Set
 # `JULIA_CPU_TARGET=native` (the documented workaround) to opt back into the ISA backends.
-const CODEGEN_IS_NATIVE = unsafe_string(Base.JLOptions().cpu_target) == "native"
+# `CODEGEN_TARGET` keeps the baked target string for the `__init__` diagnostic (see SinCosLUT.jl).
+const CODEGEN_TARGET = unsafe_string(Base.JLOptions().cpu_target)
+const CODEGEN_IS_NATIVE = CODEGEN_TARGET == "native"
 
 _llvmtype(::Type{Int8}) = "i8"; _llvmtype(::Type{Int16}) = "i16"; _llvmtype(::Type{Int32}) = "i32"
 # Generate explicit @inline permute methods per element type. (A @generated
