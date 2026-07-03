@@ -94,8 +94,11 @@ include("iterate.jl")
     end
     function default_backend(::Type{T}, steps::Integer) where T
         features = HOST_FEATURES   # const (detected at precompile) → foldable, type-stable
-        _avx512_supports(T, steps, features) ? AVX512() :
-        (T === Int8 && features.avx2 && steps == 64) ? AVX2() : Portable()
+        # CODEGEN_IS_NATIVE guards the ISA branches: under a restricted/multiversioned codegen
+        # target the CPUID features do not match what LLVM can emit, so fall back to Portable()
+        # rather than bake un-legalisable AVX-512/AVX2 into a baseline clone (see permute_avx512.jl).
+        (CODEGEN_IS_NATIVE && _avx512_supports(T, steps, features)) ? AVX512() :
+        (CODEGEN_IS_NATIVE && T === Int8 && features.avx2 && steps == 64) ? AVX2() : Portable()
     end
 elseif Sys.ARCH === :aarch64
     function default_backend(::Type{T}, steps::Integer) where T
@@ -115,6 +118,14 @@ the host CPU: `AVX512()`, `AVX2()`, or `Neon()` where the required SIMD permute 
 available, otherwise `Portable()` (the always-correct scalar fallback). AVX2 supports
 only `Int8` with `steps = 64`; NEON supports `Int8` (`steps = 64`) and `Int16`
 (`steps = 32` or `64`); other combinations fall back to `Portable()`.
+
+The x86 ISA backends (AVX-512/AVX2) are selected only when the LLVM codegen target is
+`native`. Under a restricted or multiversioned CPU target (`--cpu-target=…` /
+`JULIA_CPU_TARGET=…`, the latter being how the official binaries build every pkgimage) the
+CPU-detected features need not match what LLVM can emit, so those backends fall back to
+`Portable()` rather than bake un-legalisable ISA into a baseline clone (which would abort
+codegen). Set `JULIA_CPU_TARGET=native` to keep the ISA backends under a custom target.
+
 Pass the result (or any `Backend`) as the `backend` keyword of [`generate_carrier!`](@ref),
 [`lookup_sincos!`](@ref), [`carrier_engine`](@ref), or [`prepare`](@ref) to override the
 choice. See [`backend_name`](@ref) for a readable label.
