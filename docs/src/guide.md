@@ -127,7 +127,9 @@ backend_name(default_backend(Int8, 64))   # what will run here
     CPU-detected features need not match what LLVM can actually emit, so `default_backend`
     falls back to `Portable()` for correctness (emitting an ISA the target cannot legalise
     would abort codegen with an uncatchable `LLVM ERROR`). Set `JULIA_CPU_TARGET=native`
-    to keep the AVX-512/AVX2 backends under a custom target.
+    to keep the AVX-512/AVX2 backends under a custom target. When this fallback demotes a
+    SIMD-capable CPU, SinCosLUT emits a one-time load-time warning with this hint; silence it
+    with `ENV["SINCOSLUT_QUIET"] = "1"` (e.g. in a deliberately restricted or compiled-app build).
 
 The results are backend-independent — forcing the scalar path produces exactly the same
 values, just computed without SIMD:

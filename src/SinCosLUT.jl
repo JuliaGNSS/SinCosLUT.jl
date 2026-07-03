@@ -134,4 +134,23 @@ default_backend(table::SinCosTable{T,N}) where {T,N} = default_backend(T, N)
 
 include("signbits.jl")   # after default_backend: its `_SIGN_PREP` const prepares a table at load
 
+# Tell the user, once, if we had to demote an ISA-capable host to the scalar fallback because
+# the codegen target was restricted (see `default_backend` / permute_avx512.jl). Only fires when
+# it actually costs something — the CPU has SIMD (`avx2`) but the target could not emit it — so a
+# genuinely portable/old host stays quiet. `maxlog=1` and `SINCOSLUT_QUIET=1` keep it from nagging
+# (e.g. in a deliberately restricted / compiled-app build).
+@static if Sys.ARCH in (:x86_64, :i686)
+    function __init__()
+        if !CODEGEN_IS_NATIVE && HOST_FEATURES.avx2 && get(ENV, "SINCOSLUT_QUIET", "") != "1"
+            @warn """
+            SinCosLUT is using the scalar (Portable) fallback: the LLVM CPU target is \
+            `$(CODEGEN_TARGET)`, not `native`, so the AVX2/AVX-512 permute backends are \
+            disabled even though this CPU supports them. Set `JULIA_CPU_TARGET=native` and \
+            re-precompile to enable them (see `?default_backend`). Silence this warning with \
+            `ENV["SINCOSLUT_QUIET"] = "1"`.""" maxlog = 1
+        end
+        return nothing
+    end
+end
+
 end # module
