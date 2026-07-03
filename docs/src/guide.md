@@ -120,6 +120,15 @@ using SinCosLUT: AVX512, AVX2, Portable
 backend_name(default_backend(Int8, 64))   # what will run here
 ```
 
+!!! note "Restricted or multiversioned CPU targets"
+    The x86 ISA backends are chosen only when the LLVM codegen target is `native` (the
+    default). Under a restricted or multiversioned CPU target — `julia --cpu-target=…`, or
+    `JULIA_CPU_TARGET=…`, which is how the official binaries build every pkgimage — the
+    CPU-detected features need not match what LLVM can actually emit, so `default_backend`
+    falls back to `Portable()` for correctness (emitting an ISA the target cannot legalise
+    would abort codegen with an uncatchable `LLVM ERROR`). Set `JULIA_CPU_TARGET=native`
+    to keep the AVX-512/AVX2 backends under a custom target.
+
 The results are backend-independent — forcing the scalar path produces exactly the same
 values, just computed without SIMD:
 

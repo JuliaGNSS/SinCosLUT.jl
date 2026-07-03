@@ -59,6 +59,23 @@ end
 # different host re-precompiles and re-detects.
 const HOST_FEATURES = _x86_features()
 
+# CPUID (`HOST_FEATURES`) reports the *host*; the ISA we may legally emit is fixed by the
+# LLVM *codegen target*. These diverge under a restricted or multiversioned CPU target
+# (`--cpu-target=…` / `JULIA_CPU_TARGET=…`, the latter being how the official binaries build
+# every pkgimage): a `generic`/`haswell` clone has no AVX-512 codegen target, yet CPUID on an
+# AVX-512 host still reports AVX-512. If `default_backend` trusted CPUID there it would emit
+# AVX-512 permutes into a clone that cannot legalise them, aborting codegen outright — an
+# uncatchable `LLVM ERROR: couldn't allocate output register for constraint 'x'` (older LLVM)
+# / `Do not know how to split the result of this operator!` (newer). So gate ISA-backend
+# selection on the codegen target instead of CPUID: only when it is exactly `native` is the
+# host the codegen target, so that CPUID matches what LLVM will emit. `JLOptions().cpu_target`
+# is read here in the precompile worker, where `-C` has been set from `JULIA_CPU_TARGET`
+# (see Base.loading `create_expr_cache`), so the const captures the clone's actual target.
+# Any other target (a named CPU, or a multiversion string) falls back to `Portable()` — always
+# correct, and the only ISA a baseline clone is guaranteed to be able to emit. Set
+# `JULIA_CPU_TARGET=native` (the documented workaround) to opt back into the ISA backends.
+const CODEGEN_IS_NATIVE = unsafe_string(Base.JLOptions().cpu_target) == "native"
+
 _llvmtype(::Type{Int8}) = "i8"; _llvmtype(::Type{Int16}) = "i16"; _llvmtype(::Type{Int32}) = "i32"
 # Generate explicit @inline permute methods per element type. (A @generated
 # function here does not inline and adds ~1 call per permute → ~7× slower.)
