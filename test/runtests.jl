@@ -370,24 +370,32 @@ end
     println("default backends: ",
         join(["$T/$N→$(backend_name(default_backend(T,N)))" for (T,Ns) in cases for N in Ns], "  "))
 
-    # Multiversioning / restricted-codegen-target safety (issue #19). On an AVX-512 (or AVX2)
-    # host, CPUID reports the ISA, but a restricted codegen target — a `generic`/`haswell`
+    # Multiversioning / restricted-codegen-target safety (issue #19). On an AVX-512 host,
+    # CPUID reports the ISA, but a restricted codegen target — a `generic`/`haswell`
     # multiversion clone, exactly what the official binaries build every pkgimage as — cannot
     # legalise those permutes. Selecting the ISA backend from CPUID alone baked AVX-512 into
     # such a clone and aborted codegen with an *uncatchable* `LLVM ERROR` (a process abort, not
     # a Julia exception), so this must be checked in a subprocess. `default_backend` now gates
-    # on the codegen target: under `--cpu-target=haswell` it must fall back to a backend the
-    # target can actually emit (Portable) and produce correct output instead of crashing.
+    # on the codegen target: under a `haswell` target it must fall back to a backend the target
+    # can actually emit (Portable) and produce correct output instead of crashing.
+    #
+    # `--compiled-modules=no` forces SinCosLUT (and its `CODEGEN_IS_NATIVE` const) to be
+    # evaluated fresh under the `-C haswell` codegen target — independent of any cached pkgimage
+    # and of how a given Julia version keys that cache on the CPU target. On the pre-fix code an
+    # AVX-512 host aborts here; on the fix it resolves to Portable on any host.
     @static if Sys.ARCH in (:x86_64, :i686)
         @testset "restricted codegen target does not crash (issue #19)" begin
             proj = dirname(Base.active_project())
             script = raw"""
                 using SinCosLUT
                 using SinCosLUT: SinCosTable, carrier_engine, carrier_state, carrier_lookup,
-                                 default_backend, backend_name, generate_carrier!, _index_shift
-                # A restricted target must NOT resolve to an ISA it cannot legalise.
+                                 default_backend, backend_name, generate_carrier!, _index_shift,
+                                 CODEGEN_IS_NATIVE
+                # The gate must have engaged for the restricted (non-native) codegen target …
+                CODEGEN_IS_NATIVE && error("codegen target should not be native under -C haswell")
+                # … so no ISA the target cannot emit is selected.
                 bname = backend_name(default_backend(Int8, 64))
-                bname == "portable" || error("expected portable under --cpu-target=haswell, got $bname")
+                bname == "portable" || error("expected portable under -C haswell, got $bname")
                 # The exact reproduction from the issue: the value-based engine must run, not abort.
                 eng = carrier_engine(SinCosTable(Int8; steps = 64, amplitude = 7), 0.01)
                 carrier_lookup(eng, carrier_state(eng, 0; phase = 0.0))
@@ -402,7 +410,7 @@ end
                     error("carrier mismatch under restricted target")
                 print("NARROW_TARGET_OK")
             """
-            cmd = `$(Base.julia_cmd()) --cpu-target=haswell --project=$proj -e $script`
+            cmd = `$(Base.julia_cmd()) --compiled-modules=no --cpu-target=haswell --project=$proj -e $script`
             out = IOBuffer()
             p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out))
             output = String(take!(out))
