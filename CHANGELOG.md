@@ -1,5 +1,17 @@
 # Changelog
 
+# [3.2.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.1.1...v3.2.0) (2026-07-03)
+
+
+### Bug Fixes
+
+* **avx512:** gate ISA backends on the codegen target, not CPUID ([#19](https://github.com/JuliaGNSS/SinCosLUT.jl/issues/19)) ([30ec08c](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/30ec08c7b731b11ea91f060350adabcef9198119))
+
+
+### Features
+
+* warn once when a restricted CPU target demotes a SIMD-capable host ([f31c9e0](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/f31c9e0f9e2dd83e539edc2bd7e111577961be24))
+
 ## [3.1.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.1.0...v3.1.1) (2026-07-02)
 
 
