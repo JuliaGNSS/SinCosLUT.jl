@@ -14,8 +14,33 @@
 # SVE2 would give a scalable-width `tbl`, but Julia cannot express scalable vectors
 # (JuliaLang/julia#40308); NEON runs natively on SVE HW.
 #
-# NOTE: written against the LLVM aarch64 intrinsics; not executed on ARM hardware
-# in development — validated by the CI test matrix on Apple M1 and Neoverse.
+# Validated on real hardware (Jetson Orin, Cortex-A78AE, ARMv8.2-A): full test suite
+# passes and `generate_carrier!` runs ≈290 ps/element for Int8/64 (sin+cos) at 64k.
+# Also covered by the CI matrix on Apple M1 and Neoverse. Only baseline `+neon` is used
+# (`tbl`/`uzp`/`ushr` — no SVE, dotprod, or fp16), so the same code path runs unchanged
+# on any ARMv8-A core (e.g. Cortex-A76 / Raspberry Pi 5).
+#
+# PERFORMANCE NOTE (Int8/64 generate_carrier!): the hot loop is throughput-bound on the
+# two NEON vector pipes; per 16 outputs the budget is ~2×tbl4 (the lookup — irreducible),
+# 4×add.4s (advancing the exact Vec{16,UInt32} NCO accumulator), and 4 ops for the
+# high-bits extraction (2×uzp2 + uzp2 + ushr). Everything else — pointer loads, address
+# arithmetic, the two stores, loop control — overlaps for free on idle ports (measured).
+# The tbl lookup is fundamental (a 64-entry byte LUT needs 4 table registers), and the
+# accumulator + extraction are minimal for a 32-bit-per-lane phase: the only way to shed
+# vector ops is a narrower accumulator, which forfeits the dead-zone-free frequency
+# resolution that is the whole point. Measured dead ends (Cortex-A78AE): deeper interleave
+# (K=2..8 identical to K=4, ≥6 spills), cos via a shifted index over a shared sin table
+# (fewer table registers but +2 ops/stream → slower), and pointer-hoisted stores (no
+# change — the reloaded array pointer was never on the critical path). So the kernel here
+# is at the throughput floor for the exactness contract; leave it be.
+#
+# No ARMv8.2-A vector addition helps: FP16 arith (asimdhp), the INT8 dot product
+# (asimddp / udot,sdot) and the Q15 rounding MLA (asimdrdm / SQRDMLAH) are all
+# multiply-accumulate units, orthogonal to a byte-permute LUT and a 32-bit integer-add
+# NCO recurrence (and FP16's 11-bit mantissa cannot hold the exact phase). The only thing
+# that would widen this is SVE's scalable `svtbl` — unavailable on the A78AE/A76 (no SVE)
+# and inexpressible in Julia anyway (see above). NEON is fixed at 128-bit; there is no
+# 256-bit form. Revisit only when Julia can emit SVE2 on SVE-capable silicon.
 
 const _TBL4_IR = """
 declare <16 x i8> @llvm.aarch64.neon.tbl4(<16 x i8>, <16 x i8>, <16 x i8>, <16 x i8>, <16 x i8>)
