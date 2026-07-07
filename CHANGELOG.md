@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.2.2](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.1...v3.2.2) (2026-07-07)
+
+
+### Performance Improvements
+
+* **neon:** addp-tree sign-mask in _sign_pack on aarch64 ([812e667](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/812e6672fa13fe83b5e8860ad928de5dd352dd40))
+
 ## [3.2.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.0...v3.2.1) (2026-07-07)
 
 

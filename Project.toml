@@ -1,7 +1,7 @@
 name = "SinCosLUT"
 uuid = "59c743cf-042e-44de-8bbe-9da51d41dc19"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
-version = "3.2.1"
+version = "3.2.2"
 
 [deps]
 SIMD = "fdea26ae-647d-5447-a871-4b548cad5224"
