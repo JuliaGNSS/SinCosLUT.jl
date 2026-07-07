@@ -37,13 +37,20 @@
       ret i64 %m }
     attributes #0 = { alwaysinline }""", "entry"),
     UInt64, Tuple{NTuple{64,Base.VecElement{Int32}}}, reinterpret(Vec{64,Int32}, v).data)
-@inline _sign_pack(v::Vec{64,Int8}) = Base.llvmcall(("""
-    define i64 @entry(<64 x i8> %v) #0 {
-      %c = icmp slt <64 x i8> %v, zeroinitializer
-      %m = bitcast <64 x i1> %c to i64
-      ret i64 %m }
-    attributes #0 = { alwaysinline }""", "entry"),
-    UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
+# `_sign_pack(::Vec{64,Int8})`: pack bit 7 of 64 bytes into a UInt64. Same op, two lowerings.
+# On x86/portable the `icmp` + `bitcast <64 x i1> to i64` is optimal (→ `vpmovb2m`+kmov on
+# AVX-512, `vpmovmskb` on AVX2). On aarch64 that bitcast lowers to a per-16-lane `cmlt` + `and`
+# + `addv` + GPR-move whose serial `addv`→GPR moves dominate; the aarch64 override below reduces
+# with an `addp` (vpaddq) tree instead (one GPR move, no `addv`). Both bit-identical.
+@static if Sys.ARCH !== :aarch64
+    @inline _sign_pack(v::Vec{64,Int8}) = Base.llvmcall(("""
+        define i64 @entry(<64 x i8> %v) #0 {
+          %c = icmp slt <64 x i8> %v, zeroinitializer
+          %m = bitcast <64 x i1> %c to i64
+          ret i64 %m }
+        attributes #0 = { alwaysinline }""", "entry"),
+        UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
+end
 
 # Quadrant-sign table (N=64): entry k is the SIGN of sin/cos in quadrant k, ±1 as Int8. Permuting
 # it by the phase index recovers the exact MSB sign (the sign depends only on the index's top bit,
@@ -103,6 +110,34 @@ end
 end
 
 @static if Sys.ARCH === :aarch64
+    # aarch64 `_sign_pack`: isolate each lane's sign bit with the {1,2,…,128} bitmask, then a
+    # 4-deep `addp` (vpaddq) tree — one GPR move, no `addv` (see the x86/portable form above).
+    # Measured ≈2.4× faster than the `bitcast` lowering on Cortex-A78AE; since the NEON
+    # `_flip_words` calls this twice per flipped word, `generate_carrier_signs!` on the
+    # flip-dominated path is ≈1.58× faster (≈0.44→0.28 ns/element at 64k). Bit-identical.
+    @inline _sign_pack(v::Vec{64,Int8}) = Base.llvmcall(("""
+        declare <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8>, <16 x i8>)
+        define i64 @entry(<64 x i8> %v) #0 {
+          %c = icmp slt <64 x i8> %v, zeroinitializer
+          %s = sext <64 x i1> %c to <64 x i8>
+          %v0 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 0,i32 1,i32 2,i32 3,i32 4,i32 5,i32 6,i32 7,i32 8,i32 9,i32 10,i32 11,i32 12,i32 13,i32 14,i32 15>
+          %v1 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 16,i32 17,i32 18,i32 19,i32 20,i32 21,i32 22,i32 23,i32 24,i32 25,i32 26,i32 27,i32 28,i32 29,i32 30,i32 31>
+          %v2 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 32,i32 33,i32 34,i32 35,i32 36,i32 37,i32 38,i32 39,i32 40,i32 41,i32 42,i32 43,i32 44,i32 45,i32 46,i32 47>
+          %v3 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 48,i32 49,i32 50,i32 51,i32 52,i32 53,i32 54,i32 55,i32 56,i32 57,i32 58,i32 59,i32 60,i32 61,i32 62,i32 63>
+          %bm0 = and <16 x i8> %v0, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm1 = and <16 x i8> %v1, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm2 = and <16 x i8> %v2, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm3 = and <16 x i8> %v3, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %p0 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm0, <16 x i8> %bm1)
+          %p1 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm2, <16 x i8> %bm3)
+          %p2 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p0, <16 x i8> %p1)
+          %p3 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p2, <16 x i8> %p2)
+          %r = bitcast <16 x i8> %p3 to <2 x i64>
+          %lo = extractelement <2 x i64> %r, i32 0
+          ret i64 %lo }
+        attributes #0 = { alwaysinline }""", "entry"),
+        UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
+
     # NEON signed path: no permute, no table. The sign is the accumulator MSB, which for
     # sin sits in bit 7 of each lane's HIGH BYTE, and for cos is the MSB of acc + ¼ cycle.
     # ¼ cycle = 0x40000000 has no bits below bit 30, so adding it never carries INTO the
