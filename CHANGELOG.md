@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.2.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.0...v3.2.1) (2026-07-07)
+
+
+### Performance Improvements
+
+* **neon:** read the sign MSB directly, skipping the ±1-table permute ([090df84](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/090df844f9e90200ca95b47d446d5765cfc908f3))
+
 # [3.2.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.1.1...v3.2.0) (2026-07-03)
 
 
