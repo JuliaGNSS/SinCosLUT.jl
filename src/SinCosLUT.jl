@@ -133,7 +133,7 @@ choice. See [`backend_name`](@ref) for a readable label.
 """
 default_backend(table::SinCosTable{T,N}) where {T,N} = default_backend(T, N)
 
-include("signbits.jl")   # after default_backend: its `_SIGN_PREP` const prepares a table at load
+include("signbits.jl")   # after default_backend: its `_BITS_BACKEND` const is resolved at load
 include("twobit.jl")     # 2-bit sign+magnitude carrier; shares the signbits.jl helpers
 
 # Tell the user, once, if we had to demote an ISA-capable host to the scalar fallback because

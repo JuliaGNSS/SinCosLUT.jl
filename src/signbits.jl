@@ -3,21 +3,34 @@
 # A 1-bit carrier keeps only the SIGN of sin/cos — the natural input to a bit-wise
 # ("bit-sliced") software correlator, where the carrier wipe-off collapses to XOR and the
 # accumulate to popcount. There is no table lookup here: the sign of the NCO output is an
-# exact function of the phase accumulator's top bit, so we read it straight off the same
+# exact function of the phase accumulator's top bits, so we read it straight off the same
 # UInt32 NCO that `generate_carrier!` uses (`acc[n] = freq_word·n + offset` mod 2³²):
 #
-#   sin(2π·φ) < 0  ⇔  φ mod 1 ∈ [½, 1)      ⇔  MSB(acc)              is set
-#   cos(2π·φ) < 0  ⇔  φ mod 1 ∈ (¼, ¾)      ⇔  MSB(acc + ¼ cycle)    is set
+#   sin(2π·φ) < 0  ⇔  φ mod 1 ∈ [½, 1)      ⇔  MSB(acc)              is set  = acc₃₁
+#   cos(2π·φ) < 0  ⇔  φ mod 1 ∈ (¼, ¾)      ⇔  MSB(acc + ¼ cycle)    is set  = acc₃₁ ⊕ acc₃₀
 #
+# (adding the single bit ¼·2³² = 2³⁰ carries into bit 31 iff bit 30 is set, hence the XOR.)
 # The signs are packed into `UInt64` words (bit `j` of word `w` ↔ sample `64w+j`), a set
 # bit meaning that component is NEGATIVE (the ±1 hard-limited value is −1).
 #
-# Fast at ANY frequency via two per-word paths:
-#   • constant run — when the whole 64-sample word has one sign (a low residual carrier is a
-#     square wave with runs of thousands of samples), write it in ONE store;
-#   • otherwise — a sign flip falls inside the word: extract the top bit of all 64 phase
-#     accumulators at once with a single SIMD sign-mask (`vpmovd2m` / equivalent), O(1) per
-#     word no matter how many flips it contains — no per-sample loop.
+# Fast at ANY frequency via two per-FILL paths, split on the frequency word:
+#   • fw < 2²⁵ — every 64-sample word has ≤ 1 flip per component (64·fw < 2³¹), so a low
+#     residual carrier is runs of constant words written in ONE store each; a word that
+#     straddles a flip gets one SIMD evaluation.
+#   • fw ≥ 2²⁵ — a flip can fall in every word, so the constant-run test can never win:
+#     run a branch-free SIMD loop instead (on x86 unrolled over independent NCO streams,
+#     like the `generate_carrier!` kernel), so the per-word packs pipeline instead of
+#     serialising on the word-at-a-time scalar bookkeeping.
+# Both are O(1) per word no matter how many flips it contains — no per-sample loop.
+#
+# The per-word SIMD evaluation extracts the accumulator HIGH BYTE of all 64 lanes once
+# (bit 7 = acc₃₁, bit 6 = acc₃₀): the `_phase_index` byte-gather on x86 (without its
+# index-alignment tail, which the bit tests don't need), the `uzp2` chain on NEON —
+# evaluated in 16-lane quarters there, since a register-resident 64-lane accumulator is
+# 16 of the 32 V registers and spills. Each component then costs ONE SIMD sign-mask:
+# sin = MSB(hb), cos = MSB(hb ⊕ (hb ≪ 1)) (or MSB(hb + 0x40), same carry) — no table,
+# no permute. The Portable fallback packs the UInt32 MSBs directly (`_msb_pack`).
+# The 2-bit carrier (twobit.jl) builds on the same helpers, adding a magnitude plane.
 
 @inline _msb(x::UInt32) = (x & 0x80000000) != zero(UInt32)
 # Low-`rem`-bits mask (all ones for a full 64-lane word). Top-level, not a local closure —
@@ -52,49 +65,50 @@
         UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
 end
 
-# Quadrant-sign table (N=64): entry k is the SIGN of sin/cos in quadrant k, ±1 as Int8. Permuting
-# it by the phase index recovers the exact MSB sign (the sign depends only on the index's top bit,
-# which is the accumulator MSB — no zero-crossing rounding as a value table would have). The cos
-# column bakes in the ¼-cycle offset, so one index feeds both. `_SIGN_PREP` materialises it in
-# registers once (default backend const-folds). USED on the AVX-512 (W=64) and AVX2 (2×W=32)
-# paths below; NEON reads the MSB straight off the accumulator's high byte (no permute) and the
-# Portable fallback uses the `_msb_pack` sign-mask, so the prepared table sits unused for those.
-const _SIGN_TABLE = SinCosTable{Int8,64}(
-    ntuple(k -> (k - 1) < 32 ? Int8(1) : Int8(-1), Val(64)),                    # sin<0 ⇔ k∈[32,64)
-    ntuple(k -> (16 ≤ (k - 1) < 48) ? Int8(-1) : Int8(1), Val(64)))            # cos<0 ⇔ k∈[16,48)
-const _SIGN_PREP = prepare(_SIGN_TABLE)
-
-# Sign words (sin, cos) of one full 64-sample word that contains ≥ 1 flip. The x86 backends use
-# the package's own cheap index (byte-gather) + a permute of the ±1 quadrant table (both columns) +
-# an Int8 sign-mask per SIMD chunk — the carrier's own permute machinery, at whatever width the
-# backend runs (AVX-512: one 64-lane chunk; AVX2: 2×32). NEON instead reads the sign MSB straight
-# off the accumulator's high byte (see the aarch64 method below — no permute needed). Portable /
-# any other backend uses the generic UInt32 sign-mask. All bit-identical (all read the top bit).
-@inline _flip_words(base::UInt32, ramp::Vec{64,UInt32}) = _flip_words(_SIGN_PREP, base, ramp)
+const _BITS_BACKEND = default_backend(Int8, 64)   # const → the dispatch below folds statically
 
 # Extract lanes [o, o+W) of a Vec{64} as a Vec{W}.
 @inline _slice(v::Vec{64,T}, ::Val{o}, ::Val{W}) where {T,o,W} =
     shufflevector(v, Val(ntuple(i -> i - 1 + o, Val(W))))
 
-@inline function _flip_words(prep::Prepared{Int8,64,<:AVX512}, base::UInt32, ramp::Vec{64,UInt32})
-    idx = _phase_index(prep.backend, Vec{64,UInt32}(base) + ramp, Val(64), Int8)
-    # _apply directly (not the functor): _phase_index is _apply-safe for its backend, so the
-    # functor's `& index_mask` would be a wasted op (see carrier_lookup / _phase_index docs).
-    sv, cv = _apply(prep.backend, prep.table_registers, idx)                    # quadrant ±1 (sin, cos)
-    (_sign_pack(sv), _sign_pack(cv))
-end
-@inline _flip_words(::Prepared, base::UInt32, ramp::Vec{64,UInt32}) =           # Portable / fallback
-    (_msb_pack(Vec{64,UInt32}(base) + ramp),
-     _msb_pack(Vec{64,UInt32}(base + 0x40000000) + ramp))
+# ---- per-word evaluation: (sin_signs, cos_signs) of one 64-sample word.
+# `_bits_ramp(backend, fw)` builds the backend's per-word lane-offset object once per
+# fill; `_flip_words(backend, base, ramp)` evaluates the word at accumulator `base`;
+# `_flip2(backend, acc)` evaluates from an already-built 64-lane accumulator (the
+# branch-free x86 loops keep those live). NEON's quarter evaluation has no 64-lane
+# accumulator form — see its `_flip_words` below.
 
-# One W-lane chunk at accumulator offset `ramp_chunk`: (sin_bits, cos_bits) as UInt64 in lanes [0,W).
-@inline function _flip_chunk(prep, backend, base::UInt32, ramp_chunk::Vec{W,UInt32}) where {W}
-    s, c = _apply(backend, prep.table_registers,
-                  _phase_index(backend, Vec{W,UInt32}(base) + ramp_chunk, Val(64), Int8))
-    (_sign_pack(s), _sign_pack(c))
-end
+@inline _bits_ramp(::Backend, fw::UInt32) = _iota_u32() * Vec{64,UInt32}(fw)
+@inline _flip_words(backend::Backend, base::UInt32, ramp::Vec{64,UInt32}) =
+    _flip2(backend, Vec{64,UInt32}(base) + ramp)
+
+# Generic fallback (Portable / anything else): two UInt32 sign-masks, always correct.
+@inline _flip2(::Backend, acc::Vec{64,UInt32}) =
+    (_msb_pack(acc), _msb_pack(acc + 0x40000000))
 
 @static if Sys.ARCH in (:x86_64, :i686)
+    # hb = the raw gathered accumulator high byte — the `_phase_index` gather WITHOUT its
+    # index-alignment tail. sin = MSB(hb); cos = bit 7 of x = hb ⊕ (hb ≪ 1). One vpmovb2m
+    # per component; no table registers, no permute beyond the shared gather.
+    @inline function _flip2(::AVX512, acc::Vec{64,UInt32})
+        hb = _msbyte64(acc)
+        (_sign_pack(hb), _sign_pack(hb ⊻ (hb + hb)))
+    end
+
+    # AVX2: vpmovmskb reads the byte MSB, so move the wanted bits there with adds
+    # (vpaddb is 1 µop; a <32 x i8> `shl` legalises to vpsllw+vpand), 2 × 32-lane chunks.
+    # idx = top 6 accumulator bits, exact (idx₅ = acc₃₁, idx₄ = acc₃₀).
+    @inline function _sb_pack2(idx::Vec{32,Int8})
+        t1 = idx + idx                            # idx ≪ 1
+        x2 = (idx ⊻ t1) + (idx ⊻ t1)
+        (_sign_pack(t1 + t1), _sign_pack(x2 + x2))   # idx₅ = sign(sin); idx₅⊕idx₄ = sign(cos)
+    end
+    @inline function _flip2(b::AVX2, acc::Vec{64,UInt32})
+        s0, c0 = _sb_pack2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
+        s1, c1 = _sb_pack2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
+        (s0 | (s1 << 32), c0 | (c1 << 32))
+    end
+
     @inline _sign_pack(v::Vec{32,Int8}) = UInt64(Base.llvmcall(("""
         define i32 @entry(<32 x i8> %v) #0 {
           %c = icmp slt <32 x i8> %v, zeroinitializer
@@ -102,19 +116,12 @@ end
           ret i32 %m }
         attributes #0 = { alwaysinline }""", "entry"),
         UInt32, Tuple{NTuple{32,Base.VecElement{Int8}}}, v.data))
-    @inline function _flip_words(prep::Prepared{Int8,64,<:AVX2}, base::UInt32, ramp::Vec{64,UInt32})
-        s0, c0 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(0),  Val(32)))
-        s1, c1 = _flip_chunk(prep, prep.backend, base, _slice(ramp, Val(32), Val(32)))
-        (s0 | (s1 << 32), c0 | (c1 << 32))
-    end
 end
 
 @static if Sys.ARCH === :aarch64
     # aarch64 `_sign_pack`: isolate each lane's sign bit with the {1,2,…,128} bitmask, then a
     # 4-deep `addp` (vpaddq) tree — one GPR move, no `addv` (see the x86/portable form above).
-    # Measured ≈2.4× faster than the `bitcast` lowering on Cortex-A78AE; since the NEON
-    # `_flip_words` calls this twice per flipped word, `generate_carrier_signs!` on the
-    # flip-dominated path is ≈1.58× faster (≈0.44→0.28 ns/element at 64k). Bit-identical.
+    # Measured ≈2.4× faster than the `bitcast` lowering on Cortex-A78AE. Bit-identical.
     @inline _sign_pack(v::Vec{64,Int8}) = Base.llvmcall(("""
         declare <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8>, <16 x i8>)
         define i64 @entry(<64 x i8> %v) #0 {
@@ -138,58 +145,144 @@ end
         attributes #0 = { alwaysinline }""", "entry"),
         UInt64, Tuple{NTuple{64,Base.VecElement{Int8}}}, v.data)
 
-    # NEON signed path: no permute, no table. The sign is the accumulator MSB, which for
-    # sin sits in bit 7 of each lane's HIGH BYTE, and for cos is the MSB of acc + ¼ cycle.
-    # ¼ cycle = 0x40000000 has no bits below bit 30, so adding it never carries INTO the
-    # high byte from below — it is exactly +0x40 on that byte (mod 256 wrap = mod 2³² wrap
-    # of bit 31, which is all the sign cares about). So both sign words come from ONE
-    # 64-lane accumulator: extract the 16 high bytes with a `uzp2` chain (two uzp2.8h to the
-    # high words, one uzp2.16b to the high bytes — 3 cheap µops, all on idle ports), then
-    # pack bit 7 of all 64 bytes with a single `_sign_pack` per component. This beats the
-    # earlier ±1-table permute (2×tbl4/word ≈ 8 µops, all gone) and the generic 64-lane
-    # `_msb_pack` (a <64 x i32> compare legalises to 16 cmlt + a wide movemask — slower than
-    # collapsing to bytes first); measured on Cortex-A78AE at ~26 ns/word vs ~36 ns for the
-    # permute path (~27% faster). The permute `_SIGN_PREP` is now unused on NEON (AVX-512
-    # and AVX2 still use it); the `prep` argument is kept only for dispatch.
+    # NEON works word-quarters (16 lanes) at a time: only a 16-lane ramp/accumulator stays
+    # register-resident (4 V regs), each quarter's `uzp2` chain is transient. The 64-lane
+    # concatenation is free (it only names the four 16-byte registers as one value).
+    @inline _bits_ramp(::Neon, fw::UInt32) = (_lanes_u32(Val(16)) * fw, fw * UInt32(16))
+    @inline _hb_quarter(acc::Vec{16,UInt32}) =                      # high byte of 16 lanes
+        shufflevector(reinterpret(Vec{32,Int8}, _high_words(acc)), Val(ntuple(i -> 2i - 1, Val(16))))
+    @inline _cat16(a::Vec{16,Int8}, b::Vec{16,Int8}) = shufflevector(a, b, Val(ntuple(i -> i - 1, Val(32))))
+    @inline _cat32(a::Vec{32,Int8}, b::Vec{32,Int8}) = shufflevector(a, b, Val(ntuple(i -> i - 1, Val(64))))
+    @inline _hb64(a0::Vec{16,UInt32}, a1::Vec{16,UInt32}, a2::Vec{16,UInt32}, a3::Vec{16,UInt32}) =
+        _cat32(_cat16(_hb_quarter(a0), _hb_quarter(a1)), _cat16(_hb_quarter(a2), _hb_quarter(a3)))
 
-    # high 16-bit halves of the 64 dword lanes → Vec{64,Int16} (two uzp2.8h layers)
-    @inline _high_words64(acc::Vec{64,UInt32}) =
-        shufflevector(reinterpret(Vec{128,Int16}, acc), Val(ntuple(i -> 2i - 1, Val(64))))
-    # high byte of each dword lane → Vec{64,Int8}; bit 7 is the accumulator MSB (the sin sign)
-    @inline _high_bytes64(acc::Vec{64,UInt32}) =
-        shufflevector(reinterpret(Vec{128,Int8}, _high_words64(acc)), Val(ntuple(i -> 2i - 1, Val(64))))
-
-    @inline function _flip_words(::Prepared{Int8,64,<:Neon}, base::UInt32, ramp::Vec{64,UInt32})
-        hb  = _high_bytes64(Vec{64,UInt32}(base) + ramp)      # sin sign = bit 7 of each high byte
-        hbc = reinterpret(Vec{64,Int8},                       # cos sign = bit 7 of (acc + ¼ cycle)
-                          reinterpret(Vec{64,UInt8}, hb) + UInt8(0x40))
+    # hb bit 7 is the accumulator MSB (the sin sign); the cos sign is the MSB of
+    # (acc + ¼ cycle), and ¼ cycle = 2³⁰ has no bits below bit 30, so on the high byte it
+    # is exactly +0x40 — both components come from ONE high-byte extraction.
+    @inline function _flip2_neon(a0::Vec{16,UInt32}, a1::Vec{16,UInt32},
+                                 a2::Vec{16,UInt32}, a3::Vec{16,UInt32})
+        hb = _hb64(a0, a1, a2, a3)
+        hbc = reinterpret(Vec{64,Int8}, reinterpret(Vec{64,UInt8}, hb) + UInt8(0x40))
         (_sign_pack(hb), _sign_pack(hbc))
+    end
+    @inline function _flip_words(::Neon, base::UInt32, ramp::Tuple{Vec{16,UInt32},UInt32})
+        r, q = ramp
+        b1 = base + q; b2 = b1 + q; b3 = b2 + q
+        _flip2_neon(Vec{16,UInt32}(base) + r, Vec{16,UInt32}(b1) + r,
+                    Vec{16,UInt32}(b2) + r, Vec{16,UInt32}(b3) + r)
+    end
+end
+
+# ---- fw ≥ 2²⁵: branch-free SIMD loop over the full words, plus the masked partial tail.
+# The generic (x86/portable) form keeps Vec{64,UInt32} NCO accumulators live and is
+# unrolled over independent streams (hand-unrolled with plain locals, like kernel.jl — a
+# tuple/closure formulation boxes): AVX-512 has 32 ZMM registers and a short per-word
+# dependency chain, so 4 streams pipeline well; on AVX2 a 64-lane accumulator is already
+# 8 of the 16 YMM registers, so it runs a single stream.
+_sb_unroll(::Backend) = Val(1)
+_sb_unroll(::AVX512)  = Val(4)
+
+function _signs_fill_flips!(backend::Backend, sin_signs, cos_signs,
+                            n::Int, nwords::Int, fw::UInt32, off::UInt32)
+    rem = n - (nwords - 1) * 64                # valid lanes in the last word
+    nfull = rem == 64 ? nwords : nwords - 1
+    step = fw * UInt32(64)
+    acc0 = Vec{64,UInt32}(off) + _iota_u32() * Vec{64,UInt32}(fw)
+    acc = _signs_flips_loop!(sin_signs, cos_signs, nfull, acc0, step, _sb_unroll(backend))
+    @inbounds if nfull < nwords                # masked partial tail word
+        m = _lowmask(rem)
+        s, c = _flip2(backend, acc)
+        sin_signs[nwords] = s & m; cos_signs[nwords] = c & m
+    end
+end
+
+function _signs_flips_loop!(sin_signs, cos_signs,
+                            nfull::Int, acc1::Vec{64,UInt32}, step::UInt32, ::Val{4})
+    step4 = step * UInt32(4)                    # wraps mod 2³², like the accumulator
+    acc2 = acc1 + step; acc3 = acc2 + step; acc4 = acc3 + step
+    w = 1
+    @inbounds while w + 3 <= nfull
+        s, c = _flip2(_BITS_BACKEND, acc1); sin_signs[w]   = s; cos_signs[w]   = c
+        s, c = _flip2(_BITS_BACKEND, acc2); sin_signs[w+1] = s; cos_signs[w+1] = c
+        s, c = _flip2(_BITS_BACKEND, acc3); sin_signs[w+2] = s; cos_signs[w+2] = c
+        s, c = _flip2(_BITS_BACKEND, acc4); sin_signs[w+3] = s; cos_signs[w+3] = c
+        acc1 += step4; acc2 += step4; acc3 += step4; acc4 += step4
+        w += 4
+    end
+    @inbounds while w <= nfull                  # ≤ 3 leftover full words; acc1 tracks w
+        s, c = _flip2(_BITS_BACKEND, acc1); sin_signs[w] = s; cos_signs[w] = c
+        acc1 += step; w += 1
+    end
+    acc1                                        # positioned at the (possibly partial) tail
+end
+function _signs_flips_loop!(sin_signs, cos_signs,
+                            nfull::Int, acc1::Vec{64,UInt32}, step::UInt32, ::Val{1})
+    @inbounds for w in 1:nfull
+        s, c = _flip2(_BITS_BACKEND, acc1); sin_signs[w] = s; cos_signs[w] = c
+        acc1 += step
+    end
+    acc1
+end
+
+@static if Sys.ARCH === :aarch64
+    # NEON flip loop: one resident 16-lane accumulator plus three broadcast quarter
+    # offsets — each word's four quarter accumulators are transient, nothing spills.
+    function _signs_fill_flips!(::Neon, sin_signs, cos_signs,
+                                n::Int, nwords::Int, fw::UInt32, off::UInt32)
+        rem = n - (nwords - 1) * 64
+        nfull = rem == 64 ? nwords : nwords - 1
+        q = fw * UInt32(16)
+        q1 = Vec{16,UInt32}(q); q2 = Vec{16,UInt32}(q + q); q3 = Vec{16,UInt32}(q + q + q)
+        stepv = Vec{16,UInt32}(fw * UInt32(64))
+        acc = Vec{16,UInt32}(off) + _lanes_u32(Val(16)) * fw
+        @inbounds for w in 1:nfull
+            s, c = _flip2_neon(acc, acc + q1, acc + q2, acc + q3)
+            sin_signs[w] = s; cos_signs[w] = c
+            acc += stepv
+        end
+        @inbounds if nfull < nwords            # masked partial tail word
+            m = _lowmask(rem)
+            s, c = _flip2_neon(acc, acc + q1, acc + q2, acc + q3)
+            sin_signs[nwords] = s & m; cos_signs[nwords] = c & m
+        end
+    end
+end
+
+# ---- fw < 2²⁵: run-length regime, one word at a time. Every word has ≤ 1 flip per
+# component (64·fw < 2³¹), so a component is constant across the word iff its accumulator
+# MSB matches at the first and last lane; a low residual carrier is a square wave with
+# runs of thousands of samples, making almost every word one constant store.
+function _signs_fill_runs!(backend::Backend, sin_signs, cos_signs,
+                           n::Int, nwords::Int, fw::UInt32, off::UInt32)
+    ramp = _bits_ramp(backend, fw)
+    step = fw * UInt32(64)                     # accumulator advance per 64-sample word
+    span = fw * UInt32(63)                     # advance across the 63 lanes within a word
+    base = off                                 # accumulator at sample 0 (lane 0) = off
+    @inbounds for w in 1:nwords
+        m = _lowmask(w == nwords ? n - (w - 1) * 64 : 64)              # valid-lane mask (tail may be < 64)
+        bc = base + 0x40000000                                          # cos accumulator (+¼ cycle)
+        sin_const = _msb(base) == _msb(base + span)
+        cos_const = _msb(bc)   == _msb(bc + span)
+        if sin_const & cos_const                                        # both constant → two stores
+            sin_signs[w] = (_msb(base) ? typemax(UInt64) : zero(UInt64)) & m
+            cos_signs[w] = (_msb(bc)   ? typemax(UInt64) : zero(UInt64)) & m
+        else                                                            # a flip inside → one evaluation
+            sw, cw = _flip_words(backend, base, ramp)
+            sin_signs[w] = sw & m; cos_signs[w] = cw & m
+        end
+        base += step
     end
 end
 
 function _carrier_signs!(sin_signs::AbstractVector{UInt64}, cos_signs::AbstractVector{UInt64},
                          n::Int, fw::UInt32, off::UInt32)
     nwords = cld(n, 64)
-    ramp = _iota_u32() * Vec{64,UInt32}(fw)    # lane j = j·freq_word (accumulator offsets within a word)
-    step = fw * UInt32(64)                     # accumulator advance per 64-sample word (wraps mod 2³²)
-    span = fw * UInt32(63)                     # advance across the 63 lanes within a word
     # ≤ 1 sign flip per word ⇔ the word advances < ½ cycle ⇔ 64·fw < 2³¹ ⇔ fw < 2²⁵. Test fw
     # directly (NOT the wrapped `step`, which loses the whole-cycle count for a fast carrier).
-    single_flip = fw < 0x02000000
-    base = off                                 # accumulator at sample 0 (lane 0) = off
-    @inbounds for w in 1:nwords
-        m = _lowmask(w == nwords ? n - (w - 1) * 64 : 64)              # valid-lane mask (tail may be < 64)
-        bc = base + 0x40000000                                          # cos accumulator (+¼ cycle)
-        sin_const = single_flip && _msb(base) == _msb(base + span)
-        cos_const = single_flip && _msb(bc)   == _msb(bc + span)
-        if sin_const & cos_const                                        # both constant → two stores
-            sin_signs[w] = (_msb(base) ? typemax(UInt64) : zero(UInt64)) & m
-            cos_signs[w] = (_msb(bc)   ? typemax(UInt64) : zero(UInt64)) & m
-        else                                                            # a flip inside → one lookup
-            sw, cw = _flip_words(base, ramp)
-            sin_signs[w] = sw & m; cos_signs[w] = cw & m
-        end
-        base += step
+    if fw < 0x02000000
+        _signs_fill_runs!(_BITS_BACKEND, sin_signs, cos_signs, n, nwords, fw, off)
+    else                                       # a flip can fall in every word → branch-free loop
+        _signs_fill_flips!(_BITS_BACKEND, sin_signs, cos_signs, n, nwords, fw, off)
     end
     sin_signs, cos_signs
 end
@@ -213,10 +306,10 @@ frequency argument matches `generate_carrier!`: a raw `UInt32` `freq_word`, a
 keyword form. `phase` is the initial carrier phase in **cycles** (a `Real`; default 0).
 
 Fast at any frequency: a 1-bit carrier is a square wave, so for a low residual carrier almost
-every 64-sample word is a single constant run written with one store; where a sign flip falls
-inside a word, the 64 signs are packed with a single SIMD sign-mask (no per-sample loop). This
-is the carrier form a bit-wise correlator consumes, where wipe-off becomes XOR and accumulation
-becomes popcount.
+every 64-sample word is a single constant run written with one store; where sign flips fall
+inside words, each word's 64 signs are packed with a single SIMD sign-mask (no per-sample
+loop). This is the carrier form a bit-wise correlator consumes, where wipe-off becomes XOR
+and accumulation becomes popcount.
 
 ```julia
 n = 5000
