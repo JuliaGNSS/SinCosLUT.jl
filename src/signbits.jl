@@ -121,12 +121,16 @@ const _BITS_BACKEND = default_backend(Int8, 64)   # const → the dispatch below
         t2 = (idx + idx) + (idx + idx)               # idx ≪ 2 : MSB = acc₃₁
         (_sign_pack(t2), _sign_pack(t2 + t2))        # (plane(acc₃₁), plane(acc₃₀))
     end
-    @inline function _flip2(b::AVX2, acc::Vec{64,UInt32})
-        s0, a0 = _sb_pack2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
-        s1, a1 = _sb_pack2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
+    # Evaluate a word from its two 32-lane halves directly (lanes 0–31 and 32–63). The flip
+    # loop below keeps 32-lane accumulators rather than a Vec{64}, so it calls this form.
+    @inline function _flip2_avx2(b::AVX2, lo::Vec{32,UInt32}, hi::Vec{32,UInt32})
+        s0, a0 = _sb_pack2(_phase_index(b, lo, Val(64), Int8))
+        s1, a1 = _sb_pack2(_phase_index(b, hi, Val(64), Int8))
         s = s0 | (s1 << 32)
         (s, s ⊻ (a0 | (a1 << 32)))
     end
+    @inline _flip2(b::AVX2, acc::Vec{64,UInt32}) =
+        _flip2_avx2(b, _slice(acc, Val(0), Val(32)), _slice(acc, Val(32), Val(32)))
 
     @inline _sign_pack(v::Vec{32,Int8}) = UInt64(Base.llvmcall(("""
         define i32 @entry(<32 x i8> %v) #0 {
@@ -279,6 +283,33 @@ function _signs_flips_loop!(sin_signs, cos_signs,
         acc1 += step
     end
     acc1
+end
+
+@static if Sys.ARCH in (:x86_64, :i686)
+    # AVX2 flip loop: a resident Vec{64,UInt32} accumulator is 8 of the 16 YMM registers,
+    # and together with the sign-pack temporaries it overflows the register file — LLVM 15
+    # aborts codegen ("couldn't allocate output register for constraint 'x'", issue #25).
+    # Keep only a 32-lane (half-word) accumulator resident (4 YMM) plus a broadcast half-word
+    # offset, and evaluate each word in two 32-lane halves — the width `_flip2(::AVX2)`
+    # already slices to. Mirrors the NEON 16-lane-quarter fill below.
+    function _signs_fill_flips!(backend::AVX2, sin_signs, cos_signs,
+                                n::Int, nwords::Int, fw::UInt32, off::UInt32)
+        rem = n - (nwords - 1) * 64                # valid lanes in the last word
+        nfull = rem == 64 ? nwords : nwords - 1
+        h = Vec{32,UInt32}(fw * UInt32(32))        # low half → high half of the same word
+        stepv = Vec{32,UInt32}(fw * UInt32(64))    # one 64-sample word
+        lo = Vec{32,UInt32}(off) + _lanes_u32(Val(32)) * fw
+        @inbounds for w in 1:nfull
+            s, c = _flip2_avx2(backend, lo, lo + h)
+            sin_signs[w] = s; cos_signs[w] = c
+            lo += stepv
+        end
+        @inbounds if nfull < nwords                # masked partial tail word
+            m = _lowmask(rem)
+            s, c = _flip2_avx2(backend, lo, lo + h)
+            sin_signs[nwords] = s & m; cos_signs[nwords] = c & m
+        end
+    end
 end
 
 @static if Sys.ARCH === :aarch64

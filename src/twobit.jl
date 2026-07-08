@@ -100,13 +100,17 @@ end
         t3 = t2 + t2
         (_sign_pack(t2), _sign_pack(t3), _sign_pack(t3 + t3))   # raw planes acc₃₁/₃₀/₂₉
     end
-    @inline function _sm_flip3(b::AVX2, acc::Vec{64,UInt32})
-        s0, b0, e0 = _sm_pack3_avx2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
-        s1, b1, e1 = _sm_pack3_avx2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
+    # Evaluate a word from its two 32-lane halves directly (lanes 0–31 and 32–63). The flip
+    # loop below keeps 32-lane accumulators rather than a Vec{64}, so it calls this form.
+    @inline function _sm_flip3_avx2(b::AVX2, lo::Vec{32,UInt32}, hi::Vec{32,UInt32})
+        s0, b0, e0 = _sm_pack3_avx2(_phase_index(b, lo, Val(64), Int8))
+        s1, b1, e1 = _sm_pack3_avx2(_phase_index(b, hi, Val(64), Int8))
         s   = s0 | (s1 << 32)
         a30 = b0 | (b1 << 32)
         (s, s ⊻ a30, a30 ⊻ (e0 | (e1 << 32)))          # sin, cos, mag
     end
+    @inline _sm_flip3(b::AVX2, acc::Vec{64,UInt32}) =
+        _sm_flip3_avx2(b, _slice(acc, Val(0), Val(32)), _slice(acc, Val(32), Val(32)))
 end
 
 @static if Sys.ARCH === :aarch64
@@ -187,6 +191,33 @@ function _sm_flips_loop!(sin_signs, cos_signs, sin_mags, cos_mags,
         acc1 += step
     end
     acc1
+end
+
+@static if Sys.ARCH in (:x86_64, :i686)
+    # AVX2 flip loop: keep 32-lane (half-word) accumulators (4 YMM) plus a broadcast half-word
+    # offset instead of a resident Vec{64,UInt32} (8 of 16 YMM), which together with the pack
+    # temporaries overflows the register file and aborts LLVM-15 codegen (issue #25). Each
+    # word is evaluated in two 32-lane halves — the width `_sm_flip3(::AVX2)` already slices
+    # to. Mirrors the NEON 16-lane-quarter fill below.
+    function _sm_fill_flips!(backend::AVX2, sin_signs, cos_signs, sin_mags, cos_mags,
+                             n::Int, nwords::Int, fw::UInt32, off::UInt32)
+        rem = n - (nwords - 1) * 64                # valid lanes in the last word
+        nfull = rem == 64 ? nwords : nwords - 1
+        h = Vec{32,UInt32}(fw * UInt32(32))        # low half → high half of the same word
+        stepv = Vec{32,UInt32}(fw * UInt32(64))    # one 64-sample word
+        lo = Vec{32,UInt32}(off) + _lanes_u32(Val(32)) * fw
+        @inbounds for w in 1:nfull
+            s, c, m = _sm_flip3_avx2(backend, lo, lo + h); m = _opaque_u64(m)
+            sin_signs[w] = s; cos_signs[w] = c; sin_mags[w] = m; cos_mags[w] = ~m
+            lo += stepv
+        end
+        @inbounds if nfull < nwords                # masked partial tail word
+            m = _lowmask(rem)
+            s, c, mg = _sm_flip3_avx2(backend, lo, lo + h); mg = _opaque_u64(mg)
+            sin_signs[nwords] = s & m; cos_signs[nwords] = c & m
+            sin_mags[nwords] = mg & m; cos_mags[nwords] = ~mg & m
+        end
+    end
 end
 
 @static if Sys.ARCH === :aarch64
