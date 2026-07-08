@@ -348,19 +348,19 @@ end
             @test_throws DimensionMismatch generate_carrier_signs!(zeros(UInt64,1), c, n, 0x1)
             @test_throws ArgumentError generate_carrier_signs!(s, c, n, typemax(UInt32) + 1)
         end
-        # Cross-backend: the SIMD-chunked flip path (AVX2 2×32; the AVX-512 64-lane and NEON 4×16
-        # paths are the default backend, covered by the ref_signs tests above on their CI) must match
-        # the generic UInt32 sign-mask (Portable fallback) bit-for-bit. Forced backends, so this runs
-        # wherever the ISA is present regardless of the default choice.
+        # Cross-backend: the SIMD word evaluators (AVX2 2×32 chunks, AVX-512 byte-gather;
+        # the NEON quarter path is the default backend on its CI, covered by the ref_signs
+        # tests above) must match the generic UInt32 sign-mask (Portable fallback)
+        # bit-for-bit. Forced backends, so this runs wherever the ISA is present
+        # regardless of the default choice.
         @static if Sys.ARCH in (:x86_64, :i686)
             if SinCosLUT.HOST_FEATURES.avx2
-                using SinCosLUT: _SIGN_TABLE, _flip_words, _iota_u32, AVX2, Portable, prepare
-                pp = prepare(_SIGN_TABLE; backend = Portable())
-                pa = prepare(_SIGN_TABLE; backend = AVX2())
-                @testset "AVX2 flip path fw=$(repr(fw))" for fw in
-                        (0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd, 0x00012345, 0x7ffffff0)
-                    ramp = _iota_u32() * SIMD.Vec{64,UInt32}(fw)
-                    @test all(base -> _flip_words(pa, base, ramp) == _flip_words(pp, base, ramp),
+                using SinCosLUT: _flip_words, _bits_ramp, AVX512, AVX2, Portable
+                sbackends = SinCosLUT.HOST_FEATURES.avx512vbmi ? (AVX2(), AVX512()) : (AVX2(),)
+                @testset "$(backend_name(b)) flip path fw=$(repr(fw))" for b in sbackends,
+                        fw in (0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd, 0x00012345, 0x7ffffff0)
+                    rb = _bits_ramp(b, fw); rp = _bits_ramp(Portable(), fw)
+                    @test all(base -> _flip_words(b, base, rb) == _flip_words(Portable(), base, rp),
                               UInt32.((0x0, 0x12345678, 0x80000000, 0xabcdef01)))
                 end
             end
@@ -457,11 +457,11 @@ end
         # CI and is covered by the ref_sm tests above).
         @static if Sys.ARCH in (:x86_64, :i686)
             if SinCosLUT.HOST_FEATURES.avx2
-                using SinCosLUT: _flip_words_sm, _sm_ramp, AVX512, AVX2, Portable
+                using SinCosLUT: _flip_words_sm, _bits_ramp, AVX512, AVX2, Portable
                 backends = SinCosLUT.HOST_FEATURES.avx512vbmi ? (AVX2(), AVX512()) : (AVX2(),)
                 @testset "$(backend_name(b)) flip path fw=$(repr(fw))" for b in backends,
                         fw in (0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd, 0x00012345, 0x7ffffff0)
-                    rp = _sm_ramp(Portable(), fw); rb = _sm_ramp(b, fw)
+                    rp = _bits_ramp(Portable(), fw); rb = _bits_ramp(b, fw)
                     @test all(base -> _flip_words_sm(b, base, rb) == _flip_words_sm(Portable(), base, rp),
                               UInt32.((0x0, 0x12345678, 0x80000000, 0xabcdef01)))
                 end

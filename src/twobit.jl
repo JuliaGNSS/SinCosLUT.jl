@@ -50,8 +50,6 @@
 #   • NEON: `cmlt`/`cmtst` + the positional-bitmask `addp` tree of `_sign_pack`;
 #   • anywhere else: the generic `_msb_pack` UInt32 sign-mask (always correct).
 
-const _SM_BACKEND = default_backend(Int8, 64)   # const → the dispatch below folds statically
-
 # Empty-asm barrier pinning a UInt64 into a GPR. Used on the magnitude word before the
 # `sin_mags`/`cos_mags` stores: without it LLVM computes `~mag` by re-running the vector
 # bit test with an inverted predicate (a second vptestnmb per word on AVX-512, on the
@@ -66,14 +64,11 @@ const _SM_BACKEND = default_backend(Int8, 64)   # const → the dispatch below f
 # ---- per-word evaluation: (sin_signs, cos_signs, sin_mags) of one 64-sample word.
 # cos_mags is NOT returned — it is the complement, applied wordwise by the callers.
 #
-# `_sm_ramp(backend, fw)` builds the backend's per-word lane-offset object once per fill;
-# `_flip_words_sm(backend, base, ramp)` evaluates the word starting at accumulator `base`.
-# Most backends use a full 64-lane ramp (lane j = j·fw) and evaluate on a Vec{64}
-# accumulator; NEON uses a 16-lane ramp and derives the four quarters from scalar bases —
-# a resident Vec{64,UInt32} is 16 of the 32 V registers and forces spills (measured: the
-# spill-free quarter form is ~35% faster on Cortex-A78AE).
+# The ramp objects and word-quarter machinery are shared with the 1-bit kernel
+# (`_bits_ramp`, `_hb64` — see signbits.jl); `_flip_words_sm(backend, base, ramp)`
+# evaluates the word starting at accumulator `base`, `_sm_flip3(backend, acc)` from an
+# already-built 64-lane accumulator.
 
-@inline _sm_ramp(::Backend, fw::UInt32) = _iota_u32() * Vec{64,UInt32}(fw)
 @inline _flip_words_sm(backend::Backend, base::UInt32, ramp::Vec{64,UInt32}) =
     _sm_flip3(backend, Vec{64,UInt32}(base) + ramp)
 
@@ -155,16 +150,7 @@ end
         attributes #0 = { alwaysinline "target-features"="+neon" }""", "entry"),
         UInt64, Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, v.data, m.data)
 
-    # NEON works word-quarters (16 lanes) at a time from SCALAR bases: only the 16-lane
-    # ramp stays register-resident (4 V regs), each quarter's accumulator and `uzp2`
-    # chain is transient. The 64-lane concatenations below are free (they only name the
-    # four 16-byte registers as one value).
-    @inline _sm_ramp(::Neon, fw::UInt32) = (_lanes_u32(Val(16)) * fw, fw * UInt32(16))
-    @inline _hb_quarter(acc::Vec{16,UInt32}) =                      # high byte of 16 lanes
-        shufflevector(reinterpret(Vec{32,Int8}, _high_words(acc)), Val(ntuple(i -> 2i - 1, Val(16))))
-    @inline _cat16(a::Vec{16,Int8}, b::Vec{16,Int8}) = shufflevector(a, b, Val(ntuple(i -> i - 1, Val(32))))
-    @inline _cat32(a::Vec{32,Int8}, b::Vec{32,Int8}) = shufflevector(a, b, Val(ntuple(i -> i - 1, Val(64))))
-
+    # NEON works word-quarters (16 lanes) at a time via the shared `_hb64` (signbits.jl):
     # hb = accumulator high bytes (bit 7 = acc₃₁, bit 6 = acc₃₀, bit 5 = acc₂₉). Signs as
     # in the 1-bit NEON path: MSB(hb) and MSB(hb + 0x40) (the +¼-cycle carry). Magnitude:
     # y = hb + 0x20 has y₆ = acc₃₀ ⊕ acc₂₉ (the 0x20 carry into bit 6), read with a
@@ -172,12 +158,8 @@ end
     @inline function _flip_words_sm(::Neon, base::UInt32, ramp::Tuple{Vec{16,UInt32},UInt32})
         r, q = ramp
         b1 = base + q; b2 = b1 + q; b3 = b2 + q
-        hb = _cat32(_cat16(_hb_quarter(Vec{16,UInt32}(base) + r), _hb_quarter(Vec{16,UInt32}(b1) + r)),
-                    _cat16(_hb_quarter(Vec{16,UInt32}(b2) + r), _hb_quarter(Vec{16,UInt32}(b3) + r)))
-        hbu = reinterpret(Vec{64,UInt8}, hb)
-        hbc = reinterpret(Vec{64,Int8}, hbu + UInt8(0x40))
-        y   = reinterpret(Vec{64,Int8}, hbu + UInt8(0x20))
-        (_sign_pack(hb), _sign_pack(hbc), _bit_pack(y, Vec{64,Int8}(0x40 % Int8)))
+        _sm_flip3_neon(Vec{16,UInt32}(base) + r, Vec{16,UInt32}(b1) + r,
+                       Vec{16,UInt32}(b2) + r, Vec{16,UInt32}(b3) + r)
     end
 end
 
@@ -212,19 +194,19 @@ function _sm_flips_loop!(sin_signs, cos_signs, sin_mags, cos_mags,
     acc2 = acc1 + step; acc3 = acc2 + step; acc4 = acc3 + step
     w = 1
     @inbounds while w + 3 <= nfull
-        s, c, m = _sm_flip3(_SM_BACKEND, acc1); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc1); m = _opaque_u64(m)
         sin_signs[w] = s; cos_signs[w] = c; sin_mags[w] = m; cos_mags[w] = ~m
-        s, c, m = _sm_flip3(_SM_BACKEND, acc2); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc2); m = _opaque_u64(m)
         sin_signs[w+1] = s; cos_signs[w+1] = c; sin_mags[w+1] = m; cos_mags[w+1] = ~m
-        s, c, m = _sm_flip3(_SM_BACKEND, acc3); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc3); m = _opaque_u64(m)
         sin_signs[w+2] = s; cos_signs[w+2] = c; sin_mags[w+2] = m; cos_mags[w+2] = ~m
-        s, c, m = _sm_flip3(_SM_BACKEND, acc4); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc4); m = _opaque_u64(m)
         sin_signs[w+3] = s; cos_signs[w+3] = c; sin_mags[w+3] = m; cos_mags[w+3] = ~m
         acc1 += step4; acc2 += step4; acc3 += step4; acc4 += step4
         w += 4
     end
     @inbounds while w <= nfull                  # ≤ 3 leftover full words; acc1 tracks w
-        s, c, m = _sm_flip3(_SM_BACKEND, acc1); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc1); m = _opaque_u64(m)
         sin_signs[w] = s; cos_signs[w] = c; sin_mags[w] = m; cos_mags[w] = ~m
         acc1 += step; w += 1
     end
@@ -233,7 +215,7 @@ end
 function _sm_flips_loop!(sin_signs, cos_signs, sin_mags, cos_mags,
                          nfull::Int, acc1::Vec{64,UInt32}, step::UInt32, ::Val{1})
     @inbounds for w in 1:nfull
-        s, c, m = _sm_flip3(_SM_BACKEND, acc1); m = _opaque_u64(m)
+        s, c, m = _sm_flip3(_BITS_BACKEND, acc1); m = _opaque_u64(m)
         sin_signs[w] = s; cos_signs[w] = c; sin_mags[w] = m; cos_mags[w] = ~m
         acc1 += step
     end
@@ -245,8 +227,7 @@ end
     # transient working set the register file can afford; see _flip_words_sm above).
     @inline function _sm_flip3_neon(a0::Vec{16,UInt32}, a1::Vec{16,UInt32},
                                     a2::Vec{16,UInt32}, a3::Vec{16,UInt32})
-        hb = _cat32(_cat16(_hb_quarter(a0), _hb_quarter(a1)),
-                    _cat16(_hb_quarter(a2), _hb_quarter(a3)))
+        hb = _hb64(a0, a1, a2, a3)
         hbu = reinterpret(Vec{64,UInt8}, hb)
         hbc = reinterpret(Vec{64,Int8}, hbu + UInt8(0x40))
         y   = reinterpret(Vec{64,Int8}, hbu + UInt8(0x20))
@@ -284,7 +265,7 @@ end
 # word iff its accumulator MSB matches at the first and last lane.
 function _sm_fill_runs!(backend::Backend, sin_signs, cos_signs, sin_mags, cos_mags,
                         n::Int, nwords::Int, fw::UInt32, off::UInt32)
-    ramp  = _sm_ramp(backend, fw)
+    ramp  = _bits_ramp(backend, fw)
     step  = fw * UInt32(64)                    # accumulator advance per 64-sample word
     span  = fw * UInt32(63)                    # advance across the 63 lanes within a word
     span2 = span + span                        # same, on the doubled-phase magnitude NCO
@@ -328,10 +309,10 @@ function _carrier_signs_mags!(sin_signs::AbstractVector{UInt64}, cos_signs::Abst
     # The magnitude plane flips at twice the carrier frequency, so IT sets the constant-run
     # guard: a word is flip-free only if 64·2·fw < 2³¹ ⇔ fw < 2²⁴. Test fw directly (NOT a
     # wrapped step, which loses the whole-cycle count for a fast carrier — see signbits.jl).
-    if !_sm_always_flips(_SM_BACKEND) && fw < 0x01000000
-        _sm_fill_runs!(_SM_BACKEND, sin_signs, cos_signs, sin_mags, cos_mags, n, nwords, fw, off)
+    if !_sm_always_flips(_BITS_BACKEND) && fw < 0x01000000
+        _sm_fill_runs!(_BITS_BACKEND, sin_signs, cos_signs, sin_mags, cos_mags, n, nwords, fw, off)
     else                                       # every word may flip → branch-free SIMD loop
-        _sm_fill_flips!(_SM_BACKEND, sin_signs, cos_signs, sin_mags, cos_mags, n, nwords, fw, off)
+        _sm_fill_flips!(_BITS_BACKEND, sin_signs, cos_signs, sin_mags, cos_mags, n, nwords, fw, off)
     end
     sin_signs, cos_signs, sin_mags, cos_mags
 end
