@@ -20,7 +20,8 @@ module SinCosLUT
 
 using SIMD
 
-export SinCosTable, generate_carrier!, generate_carrier_signs!, lookup_sincos!, prepare,
+export SinCosTable, generate_carrier!, generate_carrier_signs!, generate_carrier_signs_mags!,
+       lookup_sincos!, prepare,
        cycles_per_sample, default_backend, backend_name,
        CarrierEngine, CarrierState, carrier_engine, carrier_state, carrier_lookup,
        carrier_advance, carrier_width
@@ -133,6 +134,7 @@ choice. See [`backend_name`](@ref) for a readable label.
 default_backend(table::SinCosTable{T,N}) where {T,N} = default_backend(T, N)
 
 include("signbits.jl")   # after default_backend: its `_SIGN_PREP` const prepares a table at load
+include("twobit.jl")     # 2-bit sign+magnitude carrier; shares the signbits.jl helpers
 
 # Tell the user, once, if we had to demote an ISA-capable host to the scalar fallback because
 # the codegen target was restricted (see `default_backend` / permute_avx512.jl). Only fires when

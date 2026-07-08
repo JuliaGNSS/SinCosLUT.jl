@@ -367,6 +367,108 @@ end
         end
     end
 
+    @testset "two-bit carrier sign+magnitude bits" begin
+        using SinCosLUT: _freq_word
+        # Ground truth: the same UInt32 NCO, bit-exact. sign(sin) = MSB(acc); sign(cos) =
+        # MSB(acc + ¼·2³²); mag(sin) = MSB(2·acc + ¼·2³²) ⇔ |sin| ≥ sin(π/4);
+        # mag(cos) = !mag(sin) (45° threshold: exactly one component is large at a time).
+        function ref_sm(n, fw::UInt32; phase = 0)
+            off = _freq_word(phase)
+            p = ntuple(_ -> zeros(UInt64, cld(n, 64)), 4)     # ss, cs, sm, cm
+            for k in 1:n
+                acc = fw * UInt32(k - 1) + off
+                b = UInt64(1) << ((k - 1) & 63); w = ((k - 1) >> 6) + 1
+                (acc & 0x80000000 != 0)                && (p[1][w] |= b)
+                ((acc + 0x40000000) & 0x80000000 != 0) && (p[2][w] |= b)
+                mag = (acc + acc + 0x40000000) & 0x80000000 != 0
+                p[mag ? 3 : 4][w] |= b
+            end
+            p
+        end
+        # Straddles both per-fill paths (run loop fw < 2²⁴, branch-free flip loop above),
+        # the 1-bit single-flip boundary (2²⁵), and the mod-2³² wrap traps.
+        @testset "n=$n fw=$(repr(fw))" for n in (5000, 20000, 64, 63, 130),
+                                            fw in (0x0010c6f8, 0x00ffffff, 0x01000001,
+                                                   0x01ffffff, 0x02000001, 0x0a3d70a3,
+                                                   0x2aaaaaab, 0x4ccccccd, 0xfffffff1)
+            planes = ntuple(_ -> fill(0xdeaddeaddeaddead, cld(n, 64)), 4)
+            generate_carrier_signs_mags!(planes..., n, fw)
+            @test collect(planes) == collect(ref_sm(n, fw))
+        end
+        # Float ground truth: sign and 45°-threshold magnitude of the true sin/cos, away
+        # from the (half-open) bit boundaries, plus the classic ±1/±2 octant waveform.
+        let ok = true
+            for acc in rand(UInt32, 2000)
+                φ = acc / 4.294967296e9
+                s, c = sinpi(2φ), cospi(2φ)
+                (abs(s) < 1e-6 || abs(c) < 1e-6 || abs(abs(s) - sqrt(0.5)) < 1e-6) && continue
+                planes = ntuple(_ -> zeros(UInt64, 1), 4)
+                generate_carrier_signs_mags!(planes..., 1, UInt32(0); phase = φ)
+                bits = map(pl -> isodd(pl[1]), planes)
+                ok &= bits == (s < 0, c < 0, abs(s) > sqrt(0.5), abs(c) > sqrt(0.5))
+            end
+            @test ok
+        end
+        let octant_sin = (1, 2, 2, 1, -1, -2, -2, -1), octant_cos = (2, 1, -1, -2, -2, -1, 1, 2)
+            val(sgn, mag) = (sgn ? -1 : 1) * (mag ? 2 : 1)
+            for k in 0:7                                       # octant centres
+                planes = ntuple(_ -> zeros(UInt64, 1), 4)
+                generate_carrier_signs_mags!(planes..., 1, UInt32(0); phase = k / 8 + 1 / 16)
+                bits = map(pl -> isodd(pl[1]), planes)
+                @test val(bits[1], bits[3]) == octant_sin[k + 1]
+                @test val(bits[2], bits[4]) == octant_cos[k + 1]
+            end
+        end
+        # bits past sample n in the final word are cleared, on both fill paths
+        for fw in (0x0a3d70a3, 0x0010c6f8)
+            let n = 130                    # 3 words, last word holds 2 valid bits
+                planes = ntuple(_ -> fill(typemax(UInt64), 3), 4)
+                generate_carrier_signs_mags!(planes..., n, fw)
+                @test all(pl -> (pl[3] >> (n & 63)) == 0, planes)
+            end
+        end
+        # the three frequency-argument forms agree; a ¼-cycle phase shift turns the sin
+        # planes into the cos planes; and the magnitude planes are complementary
+        let n = 5000, fs = 5_000_000, f = 1234, nw = cld(n, 64)
+            p1 = ntuple(_ -> zeros(UInt64, nw), 4); p2 = deepcopy(p1); p3 = deepcopy(p1)
+            generate_carrier_signs_mags!(p1..., n, _freq_word(cycles_per_sample(f, fs)))
+            generate_carrier_signs_mags!(p2..., n, cycles_per_sample(f, fs))
+            generate_carrier_signs_mags!(p3..., n; frequency = f, sampling_frequency = fs)
+            @test p1 == p2 == p3
+            pp = ntuple(_ -> zeros(UInt64, nw), 4)
+            generate_carrier_signs_mags!(pp..., n, cycles_per_sample(f, fs); phase = 0.25)
+            @test pp[1] == p1[2] && pp[3] == p1[4]
+            m = SinCosLUT._lowmask(n - (nw - 1) * 64)
+            @test p1[4][1:end-1] == .~p1[3][1:end-1] && p1[4][end] == ~p1[3][end] & m
+        end
+        # allocation-free on both fill paths (through a barrier, as for the 1-bit test)
+        _alloc_probe_sm(p, n, fw) = (generate_carrier_signs_mags!(p..., n, fw); nothing)
+        let n = 4096, p = ntuple(_ -> Vector{UInt64}(undef, 64), 4)
+            _alloc_probe_sm(p, n, 0x0a3d70a3); _alloc_probe_sm(p, n, 0x0010c6f8)
+            @test (@allocated _alloc_probe_sm(p, n, 0x0a3d70a3)) == 0
+            @test (@allocated _alloc_probe_sm(p, n, 0x0010c6f8)) == 0
+            @test_throws DimensionMismatch generate_carrier_signs_mags!(
+                zeros(UInt64, 1), p[2], p[3], p[4], n, 0x1)
+            @test_throws ArgumentError generate_carrier_signs_mags!(p..., n, typemax(UInt32) + 1)
+        end
+        # Cross-backend: the SIMD word evaluators must match the generic UInt32 sign-mask
+        # (Portable fallback) bit-for-bit. Forced backends, so this runs wherever the ISA
+        # is present regardless of the default choice (NEON is the default backend on its
+        # CI and is covered by the ref_sm tests above).
+        @static if Sys.ARCH in (:x86_64, :i686)
+            if SinCosLUT.HOST_FEATURES.avx2
+                using SinCosLUT: _flip_words_sm, _sm_ramp, AVX512, AVX2, Portable
+                backends = SinCosLUT.HOST_FEATURES.avx512vbmi ? (AVX2(), AVX512()) : (AVX2(),)
+                @testset "$(backend_name(b)) flip path fw=$(repr(fw))" for b in backends,
+                        fw in (0x0a3d70a3, 0x2aaaaaab, 0x4ccccccd, 0x00012345, 0x7ffffff0)
+                    rp = _sm_ramp(Portable(), fw); rb = _sm_ramp(b, fw)
+                    @test all(base -> _flip_words_sm(b, base, rb) == _flip_words_sm(Portable(), base, rp),
+                              UInt32.((0x0, 0x12345678, 0x80000000, 0xabcdef01)))
+                end
+            end
+        end
+    end
+
     println("default backends: ",
         join(["$T/$N→$(backend_name(default_backend(T,N)))" for (T,Ns) in cases for N in Ns], "  "))
 
