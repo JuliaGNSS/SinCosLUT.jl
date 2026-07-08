@@ -22,6 +22,7 @@ SinCosTable
 ```@docs
 generate_carrier!
 generate_carrier_signs!
+generate_carrier_signs_mags!
 cycles_per_sample
 ```
 

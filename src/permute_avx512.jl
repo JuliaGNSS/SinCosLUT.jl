@@ -184,7 +184,11 @@ attributes #0 = { alwaysinline "target-features"="+avx512vbmi,+avx512bw,+avx512f
     Vec{64,Int8}(Base.llvmcall((_MULTISHIFT_IR, "entry"), NTuple{64,VecElement{Int8}},
         Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, ctrl.data, v.data))
 
-@inline function _phase_index(::AVX512, acc::Vec{64,UInt32}, ::Val{N}, ::Type{Int8}) where {N}
+# Byte 3 (the high byte, bits 31:24) of all 64 dword lanes, gathered into one Vec{64,Int8}.
+# EXACT — the junk-bits caveat below is introduced only by the multishift alignment tail.
+# Also used directly by the 2-bit carrier (twobit.jl), whose bit tests want the raw
+# unshifted byte (bit 7 = acc₃₁ …) and skip the alignment tail entirely.
+@inline function _msbyte64(acc::Vec{64,UInt32})
     b = reinterpret(Vec{256,Int8}, acc)
     q0 = shufflevector(b, Val(ntuple(i -> i - 1, Val(64))))
     q1 = shufflevector(b, Val(ntuple(i -> i + 63, Val(64))))
@@ -200,7 +204,11 @@ attributes #0 = { alwaysinline "target-features"="+avx512vbmi,+avx512bw,+avx512f
     lo = _permi2(q0, gather_lo, q1)                      # lanes 0..31 = byte 3 of dwords 0..31
     hi = _permi2(q2, gather_hi, q3)                      # lanes 32..63 = byte 3 of dwords 32..63
     m = _opaque(Vec{64,Int8}(ntuple(k -> k <= 32 ? Int8(-1) : Int8(0), Val(64))))
-    msbyte = (lo & m) | (hi & ~m)                        # one vpternlogq (vector-ALU, not shuffle)
+    (lo & m) | (hi & ~m)                                 # one vpternlogq (vector-ALU, not shuffle)
+end
+
+@inline function _phase_index(::AVX512, acc::Vec{64,UInt32}, ::Val{N}, ::Type{Int8}) where {N}
+    msbyte = _msbyte64(acc)
     shift = _index_shift(Val(N)) - 24                    # byte3 >> shift right-aligns the index
     # plain `if` (not @static: the whole file is one @static block, so HOST_FEATURES does not
     # exist yet at macro-expansion time) — HOST_FEATURES is const, so the branch folds away.

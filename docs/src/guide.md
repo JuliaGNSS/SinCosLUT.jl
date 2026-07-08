@@ -166,3 +166,33 @@ first_sin_negative = (sin_signs[1] & 1) != 0
 A 1-bit carrier is a square wave, so almost every 64-sample word is a single constant
 run written with one store; only words straddling a sign flip are filled with a single
 SIMD sign-mask. It therefore stays fast at any frequency.
+
+## Two-bit (sign + magnitude) carrier
+
+A 2-bit correlator quantises each component to a sign bit plus a **magnitude** bit — the
+classic sign-magnitude local carrier of hardware GNSS correlators, which recovers most of
+the 1-bit quantisation loss. [`generate_carrier_signs_mags!`](@ref) packs all four
+bit-planes (sin/cos × sign/magnitude) into `UInt64` words with the same layout as the
+1-bit carrier. The magnitude threshold sits on the 45° octant boundary
+(`|component| ≥ sin(π/4) = √2/2` sets the bit), so reconstructing
+`value = (sign ? -1 : 1) * (mag ? 2 : 1)` yields the classic eight-segment waveform
+`sin ≈ {+1,+2,+2,+1,−1,−2,−2,−1}` — and every bit is still an exact function of the NCO
+phase, read straight off the accumulator's top three bits (no table, no rounding).
+
+```@example guide
+n = 200
+planes = [Vector{UInt64}(undef, cld(n, 64)) for _ in 1:4]  # sin/cos signs, sin/cos mags
+generate_carrier_signs_mags!(planes..., n; frequency = 1234, sampling_frequency = 5e6)
+
+# sample 0: sign and magnitude of sin (bit 0 of word 1 of each plane)
+sin0_negative = (planes[1][1] & 1) != 0
+sin0_large    = (planes[3][1] & 1) != 0   # |sin| ≥ √2/2
+(sin0_negative, sin0_large)
+```
+
+With the threshold on the octant boundary exactly one of |sin|, |cos| is large at a time,
+so the cos magnitude plane is the bitwise complement of the sin magnitude plane — both
+are filled anyway for consumers that index them independently. Like the 1-bit kernel the
+fill is O(1) per 64-sample word at any frequency: constant words (the magnitude square
+wave runs at twice the carrier frequency, so its runs are half as long) are plain stores,
+and words containing a flip are evaluated with a branch-free SIMD pass.

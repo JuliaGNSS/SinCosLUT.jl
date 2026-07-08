@@ -43,6 +43,21 @@ end
     end
 end
 
+# ---- 2-bit (sign + magnitude) carrier: four bit-planes off the NCO into UInt64 words ----
+# Same FREQ_WORD (flip-dominated → the branch-free SIMD loop; the magnitude plane flips at
+# twice the carrier frequency, so the constant-run path needs fw < 2²⁴). Guarded like the
+# 1-bit suite so benchpkg still runs against a base rev without it.
+@static if isdefined(SinCosLUT, :generate_carrier_signs_mags!)
+    SUITE["carrier_signs_mags!"] = BenchmarkGroup()
+    for (label, n) in SIZES
+        nw = cld(n, 64)
+        ss = Vector{UInt64}(undef, nw); cs = Vector{UInt64}(undef, nw)
+        sm = Vector{UInt64}(undef, nw); cm = Vector{UInt64}(undef, nw)
+        SUITE["carrier_signs_mags!"][label] =
+            @benchmarkable generate_carrier_signs_mags!($ss, $cs, $sm, $cm, $n, $FREQ_WORD)
+    end
+end
+
 # ---- 4-way interleaved fill (Int8) — the ~40 ps/elem path ----
 # Width W is the backend's SIMD width (64 on AVX-512, 32 on AVX2, …). v3 reads it off the engine;
 # the pre-v3 fallback reads it off the yielded Vec — keeps the suite runnable on AVX2-only hosts.
