@@ -86,27 +86,46 @@ const _BITS_BACKEND = default_backend(Int8, 64)   # const → the dispatch below
 @inline _flip2(::Backend, acc::Vec{64,UInt32}) =
     (_msb_pack(acc), _msb_pack(acc + 0x40000000))
 
+# The sign planes are combined from RAW accumulator-bit planes: pack plane(acc₃₁) and
+# plane(acc₃₀) with one SIMD bit-extract each, then sign(cos) = sign(sin) ⊕ plane(acc₃₀)
+# as a 64-bit SCALAR xor — the scalar pipes idle next to the saturated vector pipes, so
+# the xor is free and no byte add/xor is spent shaping a cos byte first. The 2-bit kernel
+# (twobit.jl) extends the same scheme with plane(acc₂₉) for its magnitude.
+
 @static if Sys.ARCH in (:x86_64, :i686)
+    # Pack one BIT of each byte into a UInt64: bit j set ⇔ v[j] & m[j] ≠ 0 (m is a
+    # single-bit broadcast, so this is a per-byte bit test). The and + icmp-ne + bitcast
+    # pattern lowers to a single `vptestmb` + kmov on AVX-512BW — no shifting the bit
+    # into the MSB first, which is what the AVX2 fallback below has to do.
+    @inline _bit_pack(v::Vec{64,Int8}, m::Vec{64,Int8}) = Base.llvmcall(("""
+        define i64 @entry(<64 x i8> %v, <64 x i8> %m) #0 {
+          %a = and <64 x i8> %v, %m
+          %c = icmp ne <64 x i8> %a, zeroinitializer
+          %r = bitcast <64 x i1> %c to i64
+          ret i64 %r }
+        attributes #0 = { alwaysinline "target-features"="+avx512bw,+avx512f" }""", "entry"),
+        UInt64, Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, v.data, m.data)
+
     # hb = the raw gathered accumulator high byte — the `_phase_index` gather WITHOUT its
-    # index-alignment tail. sin = MSB(hb); cos = bit 7 of x = hb ⊕ (hb ≪ 1). One vpmovb2m
-    # per component; no table registers, no permute beyond the shared gather.
+    # index-alignment tail (bit 7 = acc₃₁, bit 6 = acc₃₀). One vpmovb2m + one vptestmb.
     @inline function _flip2(::AVX512, acc::Vec{64,UInt32})
         hb = _msbyte64(acc)
-        (_sign_pack(hb), _sign_pack(hb ⊻ (hb + hb)))
+        s = _sign_pack(hb)
+        (s, s ⊻ _bit_pack(hb, Vec{64,Int8}(0x40 % Int8)))
     end
 
     # AVX2: vpmovmskb reads the byte MSB, so move the wanted bits there with adds
     # (vpaddb is 1 µop; a <32 x i8> `shl` legalises to vpsllw+vpand), 2 × 32-lane chunks.
     # idx = top 6 accumulator bits, exact (idx₅ = acc₃₁, idx₄ = acc₃₀).
     @inline function _sb_pack2(idx::Vec{32,Int8})
-        t1 = idx + idx                            # idx ≪ 1
-        x2 = (idx ⊻ t1) + (idx ⊻ t1)
-        (_sign_pack(t1 + t1), _sign_pack(x2 + x2))   # idx₅ = sign(sin); idx₅⊕idx₄ = sign(cos)
+        t2 = (idx + idx) + (idx + idx)               # idx ≪ 2 : MSB = acc₃₁
+        (_sign_pack(t2), _sign_pack(t2 + t2))        # (plane(acc₃₁), plane(acc₃₀))
     end
     @inline function _flip2(b::AVX2, acc::Vec{64,UInt32})
-        s0, c0 = _sb_pack2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
-        s1, c1 = _sb_pack2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
-        (s0 | (s1 << 32), c0 | (c1 << 32))
+        s0, a0 = _sb_pack2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
+        s1, a1 = _sb_pack2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
+        s = s0 | (s1 << 32)
+        (s, s ⊻ (a0 | (a1 << 32)))
     end
 
     @inline _sign_pack(v::Vec{32,Int8}) = UInt64(Base.llvmcall(("""
@@ -156,14 +175,52 @@ end
     @inline _hb64(a0::Vec{16,UInt32}, a1::Vec{16,UInt32}, a2::Vec{16,UInt32}, a3::Vec{16,UInt32}) =
         _cat32(_cat16(_hb_quarter(a0), _hb_quarter(a1)), _cat16(_hb_quarter(a2), _hb_quarter(a3)))
 
-    # hb bit 7 is the accumulator MSB (the sin sign); the cos sign is the MSB of
-    # (acc + ¼ cycle), and ¼ cycle = 2³⁰ has no bits below bit 30, so on the high byte it
-    # is exactly +0x40 — both components come from ONE high-byte extraction.
+    # Pack bit `b` of 64 bytes into a UInt64 via `sshl`: each lane's shift amount
+    # (j mod 8) − b moves bit b straight onto the lane's POSITIONAL bit (arithmetic
+    # right-shift smear only touches bits above position b, which the positional mask
+    # discards), so one sshl + one and per register feed the same `addp` tree as
+    # `_sign_pack` — no compare. (An and + icmp-ne formulation is NOT selected to
+    # `cmtst`; LLVM legalises it as and + cmeq + bic, one op more per register.)
+    @inline @generated _shift_vec(::Val{b}) where {b} =
+        :(Vec{64,Int8}($(Expr(:tuple, (Int8(j % 8 - b) for j in 0:63)...))))
+    @inline _shift_pack(v::Vec{64,Int8}, ::Val{b}) where {b} = _shift_pack_sshl(v, _shift_vec(Val(b)))
+    @inline _shift_pack_sshl(v::Vec{64,Int8}, sh::Vec{64,Int8}) = Base.llvmcall(("""
+        declare <16 x i8> @llvm.aarch64.neon.sshl.v16i8(<16 x i8>, <16 x i8>)
+        declare <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8>, <16 x i8>)
+        define i64 @entry(<64 x i8> %v, <64 x i8> %sh) #0 {
+          %v0 = shufflevector <64 x i8> %v, <64 x i8> undef, <16 x i32> <i32 0,i32 1,i32 2,i32 3,i32 4,i32 5,i32 6,i32 7,i32 8,i32 9,i32 10,i32 11,i32 12,i32 13,i32 14,i32 15>
+          %v1 = shufflevector <64 x i8> %v, <64 x i8> undef, <16 x i32> <i32 16,i32 17,i32 18,i32 19,i32 20,i32 21,i32 22,i32 23,i32 24,i32 25,i32 26,i32 27,i32 28,i32 29,i32 30,i32 31>
+          %v2 = shufflevector <64 x i8> %v, <64 x i8> undef, <16 x i32> <i32 32,i32 33,i32 34,i32 35,i32 36,i32 37,i32 38,i32 39,i32 40,i32 41,i32 42,i32 43,i32 44,i32 45,i32 46,i32 47>
+          %v3 = shufflevector <64 x i8> %v, <64 x i8> undef, <16 x i32> <i32 48,i32 49,i32 50,i32 51,i32 52,i32 53,i32 54,i32 55,i32 56,i32 57,i32 58,i32 59,i32 60,i32 61,i32 62,i32 63>
+          %s0 = shufflevector <64 x i8> %sh, <64 x i8> undef, <16 x i32> <i32 0,i32 1,i32 2,i32 3,i32 4,i32 5,i32 6,i32 7,i32 8,i32 9,i32 10,i32 11,i32 12,i32 13,i32 14,i32 15>
+          %s1 = shufflevector <64 x i8> %sh, <64 x i8> undef, <16 x i32> <i32 16,i32 17,i32 18,i32 19,i32 20,i32 21,i32 22,i32 23,i32 24,i32 25,i32 26,i32 27,i32 28,i32 29,i32 30,i32 31>
+          %s2 = shufflevector <64 x i8> %sh, <64 x i8> undef, <16 x i32> <i32 32,i32 33,i32 34,i32 35,i32 36,i32 37,i32 38,i32 39,i32 40,i32 41,i32 42,i32 43,i32 44,i32 45,i32 46,i32 47>
+          %s3 = shufflevector <64 x i8> %sh, <64 x i8> undef, <16 x i32> <i32 48,i32 49,i32 50,i32 51,i32 52,i32 53,i32 54,i32 55,i32 56,i32 57,i32 58,i32 59,i32 60,i32 61,i32 62,i32 63>
+          %t0 = call <16 x i8> @llvm.aarch64.neon.sshl.v16i8(<16 x i8> %v0, <16 x i8> %s0)
+          %t1 = call <16 x i8> @llvm.aarch64.neon.sshl.v16i8(<16 x i8> %v1, <16 x i8> %s1)
+          %t2 = call <16 x i8> @llvm.aarch64.neon.sshl.v16i8(<16 x i8> %v2, <16 x i8> %s2)
+          %t3 = call <16 x i8> @llvm.aarch64.neon.sshl.v16i8(<16 x i8> %v3, <16 x i8> %s3)
+          %bm0 = and <16 x i8> %t0, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm1 = and <16 x i8> %t1, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm2 = and <16 x i8> %t2, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %bm3 = and <16 x i8> %t3, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
+          %p0 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm0, <16 x i8> %bm1)
+          %p1 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm2, <16 x i8> %bm3)
+          %p2 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p0, <16 x i8> %p1)
+          %p3 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p2, <16 x i8> %p2)
+          %r = bitcast <16 x i8> %p3 to <2 x i64>
+          %lo = extractelement <2 x i64> %r, i32 0
+          ret i64 %lo }
+        attributes #0 = { alwaysinline "target-features"="+neon" }""", "entry"),
+        UInt64, Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, v.data, sh.data)
+
+    # hb bit 7 is the accumulator MSB (the sin sign), bit 6 is acc₃₀ — no byte add
+    # shapes a cos byte; the ⊕ happens on the packed words in the caller's scalar xor.
     @inline function _flip2_neon(a0::Vec{16,UInt32}, a1::Vec{16,UInt32},
                                  a2::Vec{16,UInt32}, a3::Vec{16,UInt32})
         hb = _hb64(a0, a1, a2, a3)
-        hbc = reinterpret(Vec{64,Int8}, reinterpret(Vec{64,UInt8}, hb) + UInt8(0x40))
-        (_sign_pack(hb), _sign_pack(hbc))
+        s = _sign_pack(hb)
+        (s, s ⊻ _shift_pack(hb, Val(6)))               # plane(acc₃₀); cos = s ⊕ it
     end
     @inline function _flip_words(::Neon, base::UInt32, ramp::Tuple{Vec{16,UInt32},UInt32})
         r, q = ramp

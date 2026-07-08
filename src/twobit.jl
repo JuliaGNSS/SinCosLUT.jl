@@ -42,12 +42,13 @@
 #
 # The per-word SIMD evaluation extracts the accumulator HIGH BYTE of all 64 lanes once —
 # the `_phase_index` byte-gather on x86 (without its index-alignment tail, which the bit
-# tests don't need), the `uzp2` chain on NEON — and the planes then fall out as byte
-# adds/XORs of it per the identities above. No table and no permute beyond that gather;
-# each plane costs one SIMD bit-extract:
+# tests don't need), the `uzp2` chain on NEON — then packs the three RAW bit-planes
+# acc₃₁/acc₃₀/acc₂₉ with one SIMD bit-extract each and combines them per the identities
+# above with 64-bit SCALAR xors (free on the idle scalar pipes — no byte arithmetic
+# shapes cos/mag bytes first). No table and no permute beyond that gather:
 #   • AVX-512: vpmovb2m / `vptestmb` (test one bit of each byte straight into a mask);
 #   • AVX2: shift the bit into the byte MSB (adds) + `vpmovmskb`, 2 × 32-lane chunks;
-#   • NEON: `cmlt`/`cmtst` + the positional-bitmask `addp` tree of `_sign_pack`;
+#   • NEON: `cmlt` (MSB) / per-lane `sshl` (bits 6/5) + the positional-bitmask `addp` tree;
 #   • anywhere else: the generic `_msb_pack` UInt32 sign-mask (always correct).
 
 # Empty-asm barrier pinning a UInt64 into a GPR. Used on the magnitude word before the
@@ -78,23 +79,11 @@
 end
 
 @static if Sys.ARCH in (:x86_64, :i686)
-    # Pack one BIT of each byte into a UInt64: bit j set ⇔ v[j] & m[j] ≠ 0 (m is a
-    # single-bit broadcast below, so this is a per-byte bit test). The and + icmp-ne +
-    # bitcast pattern lowers to a single `vptestmb` + kmov on AVX-512BW — no shifting the
-    # bit into the MSB first, which is what the AVX2 fallback below has to do.
-    @inline _bit_pack(v::Vec{64,Int8}, m::Vec{64,Int8}) = Base.llvmcall(("""
-        define i64 @entry(<64 x i8> %v, <64 x i8> %m) #0 {
-          %a = and <64 x i8> %v, %m
-          %c = icmp ne <64 x i8> %a, zeroinitializer
-          %r = bitcast <64 x i1> %c to i64
-          ret i64 %r }
-        attributes #0 = { alwaysinline "target-features"="+avx512bw,+avx512f" }""", "entry"),
-        UInt64, Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, v.data, m.data)
-
     # hb = the raw gathered accumulator high byte (bit 7 = acc₃₁, bit 6 = acc₃₀, bit 5 =
-    # acc₂₉) — the `_phase_index` gather WITHOUT its index-alignment tail, which the bit
-    # tests don't need. sin sign is its MSB (`_sign_pack` → vpmovb2m); cos sign and mag
-    # are bits 7/6 of x = hb ⊕ (hb ≪ 1).
+    # acc₂₉) — the `_phase_index` gather WITHOUT its index-alignment tail. sin sign is its
+    # MSB (`_sign_pack` → vpmovb2m); cos sign and mag are bits 7/6 of x = hb ⊕ (hb ≪ 1).
+    # (Packing the three raw planes + scalar xors, as AVX2/NEON do, measures ~4% SLOWER
+    # here: the shared x costs two cheap vector-ALU ops and saves a vptestmb constant.)
     @inline function _sm_flip3(::AVX512, acc::Vec{64,UInt32})
         hb = _msbyte64(acc)
         x = hb ⊻ (hb + hb)                             # bit k = hb[k] ⊕ hb[k-1]
@@ -103,58 +92,36 @@ end
          _bit_pack(x, Vec{64,Int8}(0x40 % Int8)))      # acc₃₀⊕acc₂₉ = mag
     end
 
-    # AVX2 has no per-byte bit-test-to-mask; move the wanted bit into the byte MSB with
+    # AVX2 has no per-byte bit-test-to-mask; move the wanted bits into the byte MSB with
     # adds (vpaddb is 1 µop; a <32 x i8> `shl` legalises to vpsllw+vpand) and vpmovmskb.
     # idx = top 6 accumulator bits, exact (idx₅ = acc₃₁, idx₄ = acc₃₀, idx₃ = acc₂₉).
     @inline function _sm_pack3_avx2(idx::Vec{32,Int8})
-        t1 = idx + idx                            # idx ≪ 1
-        x  = idx ⊻ t1
-        x2 = x + x
-        x4 = x2 + x2                              # x ≪ 2 : MSB = sign(cos)
-        (_sign_pack(t1 + t1), _sign_pack(x4), _sign_pack(x4 + x4))
+        t2 = (idx + idx) + (idx + idx)                  # idx ≪ 2 : MSB = acc₃₁
+        t3 = t2 + t2
+        (_sign_pack(t2), _sign_pack(t3), _sign_pack(t3 + t3))   # raw planes acc₃₁/₃₀/₂₉
     end
     @inline function _sm_flip3(b::AVX2, acc::Vec{64,UInt32})
-        i0 = _phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8)
-        i1 = _phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8)
-        s0, c0, m0 = _sm_pack3_avx2(i0)
-        s1, c1, m1 = _sm_pack3_avx2(i1)
-        (s0 | (s1 << 32), c0 | (c1 << 32), m0 | (m1 << 32))
+        s0, b0, e0 = _sm_pack3_avx2(_phase_index(b, _slice(acc, Val(0),  Val(32)), Val(64), Int8))
+        s1, b1, e1 = _sm_pack3_avx2(_phase_index(b, _slice(acc, Val(32), Val(32)), Val(64), Int8))
+        s   = s0 | (s1 << 32)
+        a30 = b0 | (b1 << 32)
+        (s, s ⊻ a30, a30 ⊻ (e0 | (e1 << 32)))          # sin, cos, mag
     end
 end
 
 @static if Sys.ARCH === :aarch64
-    # `_sign_pack` with the sign compare replaced by a bit test: lane j contributes ⇔
-    # v[j] & m[j] ≠ 0 (`cmtst` instead of `cmlt`), then the same positional-bitmask
-    # `addp` tree (see signbits.jl for why the tree beats the generic bitcast lowering).
-    @inline _bit_pack(v::Vec{64,Int8}, m::Vec{64,Int8}) = Base.llvmcall(("""
-        declare <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8>, <16 x i8>)
-        define i64 @entry(<64 x i8> %v, <64 x i8> %m) #0 {
-          %a = and <64 x i8> %v, %m
-          %c = icmp ne <64 x i8> %a, zeroinitializer
-          %s = sext <64 x i1> %c to <64 x i8>
-          %v0 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 0,i32 1,i32 2,i32 3,i32 4,i32 5,i32 6,i32 7,i32 8,i32 9,i32 10,i32 11,i32 12,i32 13,i32 14,i32 15>
-          %v1 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 16,i32 17,i32 18,i32 19,i32 20,i32 21,i32 22,i32 23,i32 24,i32 25,i32 26,i32 27,i32 28,i32 29,i32 30,i32 31>
-          %v2 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 32,i32 33,i32 34,i32 35,i32 36,i32 37,i32 38,i32 39,i32 40,i32 41,i32 42,i32 43,i32 44,i32 45,i32 46,i32 47>
-          %v3 = shufflevector <64 x i8> %s, <64 x i8> undef, <16 x i32> <i32 48,i32 49,i32 50,i32 51,i32 52,i32 53,i32 54,i32 55,i32 56,i32 57,i32 58,i32 59,i32 60,i32 61,i32 62,i32 63>
-          %bm0 = and <16 x i8> %v0, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
-          %bm1 = and <16 x i8> %v1, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
-          %bm2 = and <16 x i8> %v2, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
-          %bm3 = and <16 x i8> %v3, <i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128,i8 1,i8 2,i8 4,i8 8,i8 16,i8 32,i8 64,i8 -128>
-          %p0 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm0, <16 x i8> %bm1)
-          %p1 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %bm2, <16 x i8> %bm3)
-          %p2 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p0, <16 x i8> %p1)
-          %p3 = call <16 x i8> @llvm.aarch64.neon.addp.v16i8(<16 x i8> %p2, <16 x i8> %p2)
-          %r = bitcast <16 x i8> %p3 to <2 x i64>
-          %lo = extractelement <2 x i64> %r, i32 0
-          ret i64 %lo }
-        attributes #0 = { alwaysinline "target-features"="+neon" }""", "entry"),
-        UInt64, Tuple{NTuple{64,VecElement{Int8}},NTuple{64,VecElement{Int8}}}, v.data, m.data)
-
     # NEON works word-quarters (16 lanes) at a time via the shared `_hb64` (signbits.jl):
-    # hb = accumulator high bytes (bit 7 = acc₃₁, bit 6 = acc₃₀, bit 5 = acc₂₉). Signs as
-    # in the 1-bit NEON path: MSB(hb) and MSB(hb + 0x40) (the +¼-cycle carry). Magnitude:
-    # y = hb + 0x20 has y₆ = acc₃₀ ⊕ acc₂₉ (the 0x20 carry into bit 6), read with a
-    # single bit-6 test — no shift needed.
+    # hb = accumulator high bytes (bit 7 = acc₃₁, bit 6 = acc₃₀, bit 5 = acc₂₉). Pack the
+    # three raw bit-planes off the SAME hb (`cmlt` for the MSB, `cmtst` for bits 6/5 — no
+    # byte adds shape cos/mag bytes first); the caller's scalar xors combine them.
+    @inline function _sm_flip3_neon(a0::Vec{16,UInt32}, a1::Vec{16,UInt32},
+                                    a2::Vec{16,UInt32}, a3::Vec{16,UInt32})
+        hb = _hb64(a0, a1, a2, a3)
+        s   = _sign_pack(hb)                            # plane(acc₃₁) = sign(sin)
+        a30 = _shift_pack(hb, Val(6))
+        a29 = _shift_pack(hb, Val(5))
+        (s, s ⊻ a30, a30 ⊻ a29)                        # sin, cos, mag
+    end
     @inline function _flip_words_sm(::Neon, base::UInt32, ramp::Tuple{Vec{16,UInt32},UInt32})
         r, q = ramp
         b1 = base + q; b2 = b1 + q; b3 = b2 + q
@@ -223,17 +190,6 @@ function _sm_flips_loop!(sin_signs, cos_signs, sin_mags, cos_mags,
 end
 
 @static if Sys.ARCH === :aarch64
-    # Planes of one word given its four quarter accumulators (16 lanes each — the
-    # transient working set the register file can afford; see _flip_words_sm above).
-    @inline function _sm_flip3_neon(a0::Vec{16,UInt32}, a1::Vec{16,UInt32},
-                                    a2::Vec{16,UInt32}, a3::Vec{16,UInt32})
-        hb = _hb64(a0, a1, a2, a3)
-        hbu = reinterpret(Vec{64,UInt8}, hb)
-        hbc = reinterpret(Vec{64,Int8}, hbu + UInt8(0x40))
-        y   = reinterpret(Vec{64,Int8}, hbu + UInt8(0x20))
-        (_sign_pack(hb), _sign_pack(hbc), _bit_pack(y, Vec{64,Int8}(0x40 % Int8)))
-    end
-
     # NEON flip loop: one resident 16-lane accumulator (4 V regs) plus three broadcast
     # quarter offsets — each word's four quarter accumulators are transient, so nothing
     # spills (a resident 64-lane accumulator is 16 of the 32 V regs and forced ~26
