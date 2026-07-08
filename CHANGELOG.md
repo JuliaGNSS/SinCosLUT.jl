@@ -1,5 +1,18 @@
 # Changelog
 
+# [3.3.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.2...v3.3.0) (2026-07-08)
+
+
+### Features
+
+* 2-bit sign+magnitude carrier (generate_carrier_signs_mags!) ([d560e9d](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/d560e9d42116521a6a2b69e31649f2e43ba18198))
+
+
+### Performance Improvements
+
+* **neon:** sshl bit-plane packs, cos/mag combined by scalar xor ([ff3e812](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/ff3e8129e7481a536f5ea7488551927b0d5e3ea4))
+* **signbits:** branch-free flip loop and table-free sign packs ([383cff2](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/383cff28d1d62d16f9a88bc484a6f0bb65e29203))
+
 ## [3.2.2](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.1...v3.2.2) (2026-07-07)
 
 
