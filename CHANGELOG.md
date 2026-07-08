@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.3.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.3.0...v3.3.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* **avx2:** narrow flip-loop accumulator to Vec{32} to avoid LLVM-15 register exhaustion ([73b6a8c](https://github.com/JuliaGNSS/SinCosLUT.jl/commit/73b6a8c3bd744a95a533eb375040b6fda40f2869)), closes [#25](https://github.com/JuliaGNSS/SinCosLUT.jl/issues/25)
+
 # [3.3.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.2.2...v3.3.0) (2026-07-08)
 
 
