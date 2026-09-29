@@ -1,5 +1,7 @@
 # Changelog
 
+# [4.0.0](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.3.1...v4.0.0) (2026-09-29)
+
 ## [3.3.1](https://github.com/JuliaGNSS/SinCosLUT.jl/compare/v3.3.0...v3.3.1) (2026-07-08)
 
 
